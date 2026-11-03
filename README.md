@@ -30,7 +30,23 @@ SQL 语法以目标版本为准：CTE、窗口函数需要 MySQL 8.0+，JSON 函
 
 ## 安装
 
-将完整仓库克隆或复制到对应工具的技能目录，目录名使用 `mysql-skill`：
+使用 [skills CLI](https://github.com/vercel-labs/skills) 安装，需先安装 Node.js：
+
+```sh
+npx skills add YuiKira/mysql-skill
+```
+
+指定 Codex 和 Claude Code，并安装到个人技能目录：
+
+```sh
+npx skills add YuiKira/mysql-skill --skill mysql-skill --agent codex claude-code --global
+```
+
+安装后仍需按下文安装 Python 依赖并配置本地连接。DeepSeek Harness 可使用共享目录
+`~/.agents/skills/mysql-skill`，或按下面的路径手动安装。
+
+也可以从 [Releases](https://github.com/YuiKira/mysql-skill/releases) 下载 ZIP，
+将完整仓库解压或复制到对应工具的技能目录，目录名使用 `mysql-skill`：
 
 | 工具 | 个人技能路径 |
 | --- | --- |

@@ -33,7 +33,24 @@ require MySQL 8.0+; JSON functions require 5.7+.
 
 ## Installation
 
-Clone or copy the complete repository to the skill directory for your tool:
+Install with the [skills CLI](https://github.com/vercel-labs/skills), which requires Node.js:
+
+```sh
+npx skills add YuiKira/mysql-skill
+```
+
+For a personal installation targeting Codex and Claude Code:
+
+```sh
+npx skills add YuiKira/mysql-skill --skill mysql-skill --agent codex claude-code --global
+```
+
+Then install the Python dependencies and configure connections as described below.
+DeepSeek Harness can use the shared `~/.agents/skills/mysql-skill` directory
+or a manual installation at one of the following paths.
+
+Alternatively, download a ZIP from [Releases](https://github.com/YuiKira/mysql-skill/releases)
+and extract or copy the complete repository to the skill directory for your tool:
 
 | Tool | Personal skill path |
 | --- | --- |
@@ -152,7 +169,7 @@ Use the interpreter with dependencies installed:
 Default tests use fictional configurations and mocked connections. Integration
 tests are skipped unless `MYSQL_SKILL_TEST_PORT` points to a disposable local
 test instance. Optional `MYSQL_SKILL_TEST_PASSWORD` supplies that instance's root
-password. Never target a business instance. GitHub Actions also defines an
+password. Never target a business instance. GitHub Actions also defines
 isolated MySQL 5.5, 5.6, 5.7, and 8.0 integration services.
 
 ## License
