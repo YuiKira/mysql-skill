@@ -40,6 +40,10 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(result["success"], result["error"])
         self.assertEqual(result["data"]["rows"], [[1], [2]])
         self.assertTrue(result["data"]["truncated"])
+        execution = result["data"]["execution"]
+        version = tuple(int(part) for part in execution["server_version"].split("."))
+        self.assertEqual(execution["read_only_transaction"], version >= (5, 6, 5))
+        self.assertEqual(execution["timeout_mode"], "server" if version >= (5, 7, 8) else "socket")
 
     def test_existing_limit_and_offset(self):
         result = self.invoke("query", "--sql", "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 1 OFFSET 1")

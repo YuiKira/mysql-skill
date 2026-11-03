@@ -8,7 +8,7 @@ description: "Use when a task requires connecting to MySQL by alias, querying da
 ## Scope
 
 Use the shared Python CLI with Codex, Claude Code, or DeepSeek Harness.
-Support direct MySQL 5.7+ connections, read-only SELECT queries, table discovery,
+Support direct MySQL 5.5+ connections, read-only SELECT queries, table discovery,
 column inspection, and local diagnostics. MySQL 8.0+ is recommended.
 Writes, migrations, stored procedures, and MariaDB are outside this version.
 
@@ -72,8 +72,10 @@ to edit their real file locally. Plaintext local credentials are supported.
 The CLI suppresses raw exceptions and redacts configured host, user, and
 password strings from query output. Do not enable driver tracing.
 
-Use a dedicated SELECT-only database account. The CLI also validates SQL and
-starts a READ ONLY transaction. It has no write override.
+Use a dedicated SELECT-only database account. The CLI validates SQL and uses
+READ ONLY transactions on MySQL 5.6.5+. MySQL 5.5 and 5.6.0-5.6.4 lack that
+transaction mode; database grants enforce the account's read-only boundary.
+The CLI has no write override.
 
 For SSH-only targets, use the installed SSH skill to establish an authorized
 loopback tunnel, then use a locally configured MySQL alias for its endpoint.
@@ -86,14 +88,21 @@ Stdout contains one JSON document with `schema_version`, `success`, `operation`,
 `retryable=false`. Help exits 0 with human-readable usage.
 
 Query and schema data contain `columns`, `rows`, `row_count`, `truncated`, and
-`cells_truncated`. Rows are arrays aligned with columns, preserving duplicate
+`cells_truncated`, and `execution`. Execution reports the normalized numeric
+server version, read-only transaction availability, timeout mode, and effective
+timeout seconds. Version suffixes such as `-log` are accepted and omitted from
+output. Rows are arrays aligned with columns, preserving duplicate
 column names. Decimal and temporal values are strings; binary cells are omitted.
 Output is capped at 256 KiB. Always disclose truncated results. Query output
 may contain sensitive business data; keep the requested scope narrow.
 
-Defaults: 100 returned rows, 15-second server SELECT timeout. Maximums:
-1,000 returned rows and 60 seconds. Socket read timeout is server timeout plus
-5 seconds. This is not a strict end-to-end wall-clock deadline.
+Defaults: 100 returned rows and `--timeout 15`. Maximums: 1,000 rows and
+`--timeout 60`. MySQL 5.7.8+ uses a server SELECT timeout; earlier versions use
+only the socket read timeout. Socket read timeout is `--timeout` plus 5 seconds
+on all versions. A socket timeout does not cancel server work; stop and report
+this limitation when `execution.timeout_mode` is `socket`. These limits are not
+a strict end-to-end wall-clock deadline. Use SQL supported by the target version:
+CTEs and window functions require MySQL 8.0+, and JSON functions require 5.7+.
 
 ## Errors
 
@@ -104,6 +113,7 @@ Defaults: 100 returned rows, 15-second server SELECT timeout. Maximums:
 - `access_denied`: ask the user to fix the local account or grants; do not expose raw diagnostics.
 - `query_timeout` / `connection_lost`: stop; narrow scope or verify server state before a new user-authorized query.
 - `connection_failed`: report the alias and ask the user to check local connection settings or tunnel state.
+- `unsupported_server`: MySQL 5.5+ is required; MariaDB remains unsupported.
 
 ## Harness Installation
 

@@ -165,6 +165,7 @@ class SkillTests(unittest.TestCase):
     def test_execute_sets_timeout_readonly_and_bounds_fetch(self):
         import pymysql
         connection = MagicMock()
+        connection.get_server_info.return_value = "5.7.20-log"
         cursor = connection.cursor.return_value.__enter__.return_value
         cursor.description = [("id",)]
         cursor.fetchmany.return_value = [(1,), (2,), (3,)]
@@ -181,6 +182,7 @@ class SkillTests(unittest.TestCase):
     def test_setup_failure_stops_before_user_query_and_closes(self):
         import pymysql
         connection = MagicMock()
+        connection.get_server_info.return_value = "5.7.20-log"
         cursor = connection.cursor.return_value.__enter__.return_value
         cursor.execute.side_effect = pymysql.OperationalError(1045, self.entry["password"])
         with patch.object(pymysql, "connect", return_value=connection):
@@ -189,6 +191,52 @@ class SkillTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "access_denied")
         self.assertEqual(cursor.execute.call_count, 1)
         connection.close.assert_called_once()
+
+    def test_version_specific_session_setup(self):
+        import pymysql
+        cases = [
+            ("5.5.20-log", False, False),
+            ("5.6.4-log", False, False),
+            ("5.6.5", True, False),
+            ("5.6.16-log", True, False),
+            ("5.7.7-log", True, False),
+            ("5.7.8", True, True),
+            ("5.7.20", True, True),
+            ("8.0.44-commercial", True, True),
+        ]
+        for version, readonly, server_timeout in cases:
+            with self.subTest(version=version):
+                connection = MagicMock()
+                connection.get_server_info.return_value = version
+                cursor = connection.cursor.return_value.__enter__.return_value
+                cursor.description = [("id",)]
+                cursor.fetchmany.return_value = [(1,)]
+                with patch.object(pymysql, "connect", return_value=connection):
+                    result = skill.execute({"read_timeout": 20}, "SELECT 1 LIMIT 2", None, 1, 15)
+                commands = [call.args[0] for call in cursor.execute.call_args_list]
+                expected = ["SET SESSION MAX_EXECUTION_TIME = %s"] if server_timeout else []
+                expected += ["START TRANSACTION READ ONLY" if readonly else "START TRANSACTION",
+                             "SELECT 1 LIMIT 2"]
+                self.assertEqual(commands, expected)
+                self.assertEqual(result["execution"]["read_only_transaction"], readonly)
+                self.assertEqual(result["execution"]["timeout_mode"], "server" if server_timeout else "socket")
+                self.assertEqual(result["execution"]["timeout_seconds"], 15 if server_timeout else 20)
+                self.assertEqual(result["execution"]["server_version"], version.split("-")[0])
+                connection.close.assert_called_once()
+
+    def test_unsupported_server_stops_before_sql_and_does_not_echo_banner(self):
+        import pymysql
+        for version in ("5.1.73-log", "5.5.5-10.11.6-MariaDB", "private-server-banner", "5.7"):
+            with self.subTest(version=version):
+                connection = MagicMock()
+                connection.get_server_info.return_value = version
+                with patch.object(pymysql, "connect", return_value=connection):
+                    with self.assertRaises(skill.SkillError) as caught:
+                        skill.execute({}, "SELECT 1 LIMIT 2", None, 1, 15)
+                self.assertEqual(caught.exception.code, "unsupported_server")
+                self.assertNotIn(version, str(caught.exception))
+                connection.cursor.assert_not_called()
+                connection.close.assert_called_once()
 
     def test_connection_loss_is_not_retryable(self):
         import pymysql

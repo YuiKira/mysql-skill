@@ -17,7 +17,7 @@ import time
 import uuid
 import warnings
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_SQL_BYTES = 64 * 1024
 MAX_CELL_CHARS = 4096
@@ -207,15 +207,32 @@ def database_error(error):
     return SkillError("database_error", "Database operation failed; raw diagnostics are suppressed.")
 
 
+def server_capabilities(server_info):
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[-+\s]|$)", server_info)
+    if not match or "mariadb" in server_info.lower():
+        raise SkillError("unsupported_server", "Expected a MySQL server version of 5.5 or newer.")
+    version = tuple(int(part) for part in match.groups())
+    if version < (5, 5, 0):
+        raise SkillError("unsupported_server", "MySQL versions older than 5.5 are not supported.")
+    return {"server_version": ".".join(str(part) for part in version),
+            "read_only_transaction": version >= (5, 6, 5),
+            "server_timeout": version >= (5, 7, 8)}
+
+
 def execute(options, sql, params, limit, timeout):
     import pymysql
 
     connection = None
     try:
         connection = pymysql.connect(**options, cursorclass=pymysql.cursors.SSCursor)
+        capabilities = server_capabilities(connection.get_server_info())
         with connection.cursor() as cursor:
-            cursor.execute("SET SESSION MAX_EXECUTION_TIME = %s", (timeout * 1000,))
-            cursor.execute("START TRANSACTION READ ONLY")
+            if capabilities["server_timeout"]:
+                cursor.execute("SET SESSION MAX_EXECUTION_TIME = %s", (timeout * 1000,))
+            if capabilities["read_only_transaction"]:
+                cursor.execute("START TRANSACTION READ ONLY")
+            else:
+                cursor.execute("START TRANSACTION")
             cursor.execute(sql, params)
             columns = [column[0] for column in cursor.description or ()]
             rows = []
@@ -227,7 +244,11 @@ def execute(options, sql, params, limit, timeout):
                 truncated_cells |= any(cut for _, cut in converted)
             truncated = len(rows) > limit
             return {"columns": columns, "rows": rows[:limit], "row_count": min(len(rows), limit),
-                    "truncated": truncated, "cells_truncated": truncated_cells}
+                    "truncated": truncated, "cells_truncated": truncated_cells,
+                    "execution": {"server_version": capabilities["server_version"],
+                                  "read_only_transaction": capabilities["read_only_transaction"],
+                                  "timeout_mode": "server" if capabilities["server_timeout"] else "socket",
+                                  "timeout_seconds": timeout if capabilities["server_timeout"] else options["read_timeout"]}}
     except pymysql.MySQLError as error:
         raise database_error(error) from None
     finally:

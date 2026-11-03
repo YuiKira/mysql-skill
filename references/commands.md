@@ -20,13 +20,30 @@ python "<ROOT>/scripts/mysql_skill.py" [--config "<PATH>"] <command> [options]
 `--timeout 1..60` seconds (default 15). SQL text and files are limited to 64 KiB.
 Only one statement is supported. Common built-in functions are supported;
 unknown or qualified functions, user variables, writes, locks, executable
-comments, and file output are rejected. CTEs and SELECT UNION are supported.
+comments, and file output are rejected. SELECT UNION is supported. CTEs and
+window functions require MySQL 8.0+; JSON functions require 5.7+.
 
-Queries run in a read-only transaction, use a streaming cursor, and close the
+Queries use a streaming cursor and close the
 connection after collecting at most limit + 1 rows. The top-level SQL LIMIT is
 capped at limit + 1, preserving smaller limits and offsets. No automatic retries occur.
-The server must accept `MAX_EXECUTION_TIME` and read-only transactions; failure
-stops the operation without running the requested query.
+Session setup uses the numeric version from the MySQL handshake. Suffixes such
+as `-log` and `-commercial` are accepted. Raw version banners are not returned.
+
+| MySQL version | Transaction | Timeout |
+| --- | --- | --- |
+| 5.5.x, 5.6.0-5.6.4 | Regular transaction; SELECT-only account required | Socket read only |
+| 5.6.5-5.7.7 | READ ONLY | Socket read only |
+| 5.7.8+ | READ ONLY | Server MAX_EXECUTION_TIME and socket read |
+
+`--timeout` controls the server timeout where available; the socket read
+timeout is always `--timeout + 5` seconds. Socket timeout does not cancel the
+server query and is not an end-to-end deadline. No query is retried automatically.
+Unexpected setup errors stop the query rather than switching execution modes.
+Results include an `execution` object with `server_version`,
+`read_only_transaction`, `timeout_mode` (`server` or `socket`), and
+`timeout_seconds` for that mode. A SELECT-only account is required on all versions;
+MySQL 5.5 has no READ ONLY transaction mode. Server versions below 5.5 and MariaDB
+are rejected before session SQL is sent.
 
 ## Local Configuration
 
@@ -85,6 +102,6 @@ Do not query credentials or connection metadata to test this against real data.
 Error codes include `invalid_arguments`, `invalid_alias`, `config_not_found`,
 `invalid_config`, `invalid_sql`, `query_rejected`, `sql_file_error`,
 `dependency_missing`, `access_denied`, `query_timeout`, `connection_failed`,
-`connection_lost`, `database_error`, `output_too_large`, `interrupted`, and
+`connection_lost`, `unsupported_server`, `database_error`, `output_too_large`, `interrupted`, and
 `internal_error`. All errors have `retryable=false`. Raw server messages,
 SQL text, stack traces, and connection arguments are not returned.

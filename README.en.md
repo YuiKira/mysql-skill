@@ -8,13 +8,28 @@ internally from a local file. The agent uses aliases without opening that file.
 
 ## Features
 
-- Read-only SELECT queries, including CTEs and UNION.
+- Read-only SELECT and UNION queries; CTEs on MySQL 8.0+.
 - Table discovery and column inspection.
 - Alias listing and local diagnostics without exposing connection details.
 - JSON output, credential redaction, query timeouts, and bounded results.
-- Windows, macOS, and Linux; Python 3.10+ and MySQL 5.7+ required. MySQL 8.0+ recommended.
+- Windows, macOS, and Linux; Python 3.10+ and MySQL 5.5+ required. MySQL 8.0+ recommended.
 
 This version excludes writes, migrations, stored procedures, and MariaDB.
+
+### MySQL Compatibility
+
+Version strings such as `5.5.20-log`, `5.6.16-log`, and `5.7.20` are supported.
+The `-log` suffix does not affect version detection.
+
+| MySQL version | Transaction mode | Timeout |
+| --- | --- | --- |
+| 5.5.x, 5.6.0-5.6.4 | Regular transaction; SELECT-only grants enforce account permissions | Socket read |
+| 5.6.5-5.7.7 | READ ONLY | Socket read |
+| 5.7.8+ | READ ONLY | Server SELECT and socket read |
+
+Use a dedicated SELECT-only account on every version. Socket timeout does not
+cancel server work. SQL must match the target version: CTEs and window functions
+require MySQL 8.0+; JSON functions require 5.7+.
 
 ## Installation
 
@@ -108,10 +123,16 @@ Replace `<PYTHON>` with the virtual environment interpreter:
 <PYTHON> "scripts/mysql_skill.py" query --alias business --sql-file "query.sql" --limit 100 --timeout 15
 ```
 
-The default returned row limit is 100, maximum 1,000. The server SELECT timeout
-defaults to 15 seconds, maximum 60. The CLI also tightens the top-level SQL
+The default returned row limit is 100, maximum 1,000. `--timeout` defaults to
+15 seconds, maximum 60. MySQL 5.7.8+ uses it for the server SELECT timeout.
+On every version, socket read timeout is that value plus 5 seconds; it limits
+individual read waits, not total execution time. The CLI also tightens the top-level SQL
 LIMIT to the returned row limit plus one, preserving a smaller existing limit
 and the offset. Scans, sorts, and aggregations can still process more rows.
+
+The result's `execution` field reports the normalized version, read-only
+transaction availability, timeout mode, and effective timeout seconds for that
+mode. Raw server version banners are not returned.
 
 Output is capped at 256 KiB and text cells at 4,096 characters. Binary cells
 are size markers. Inspect `truncated` and `cells_truncated` for omitted data.
@@ -132,7 +153,7 @@ Default tests use fictional configurations and mocked connections. Integration
 tests are skipped unless `MYSQL_SKILL_TEST_PORT` points to a disposable local
 test instance. Optional `MYSQL_SKILL_TEST_PASSWORD` supplies that instance's root
 password. Never target a business instance. GitHub Actions also defines an
-isolated MySQL 8.0 integration service.
+isolated MySQL 5.5, 5.6, 5.7, and 8.0 integration services.
 
 ## License
 
