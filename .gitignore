@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+connections.json
+connections.*.json
+!config/connections.example.json
+*.pem
+*.key
+*.log
+.DS_Store

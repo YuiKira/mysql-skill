@@ -1,0 +1,6 @@
+interface:
+  display_name: "MySQL Skill"
+  short_description: "Query MySQL by alias without exposing credentials"
+  default_prompt: "Use $mysql-skill to inspect a MySQL database through a local alias."
+policy:
+  allow_implicit_invocation: true

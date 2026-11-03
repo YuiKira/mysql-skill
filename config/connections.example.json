@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "connections": {
+    "example": {
+      "host": "db.example.invalid",
+      "port": 3306,
+      "user": "example_reader",
+      "password": "replace-locally",
+      "database": "example_app"
+    }
+  }
+}
