@@ -2,9 +2,13 @@
 
 [中文](README.md) | [English](README.en.md)
 
-Query MySQL through local aliases with **Codex, Claude Code, and DeepSeek Harness (dsh)**.
-The Python CLI reads connection addresses, usernames, and plaintext passwords
-internally from a local file. The agent uses aliases without opening that file.
+**Let AI query MySQL without handing it your database credentials.**
+
+Configure connections once on your machine. The local CLI reads the credentials,
+connects to MySQL, and redacts the current connection's address, username, and
+password from returned results. The agent invokes queries by alias without
+opening the credential file or receiving credentials in chat. Works with
+**Codex, Claude Code, and DeepSeek Harness (dsh)**.
 
 ## Features
 

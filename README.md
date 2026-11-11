@@ -2,8 +2,10 @@
 
 [中文](README.md) | [English](README.en.md)
 
-通过本地别名查询 MySQL，适用于 **Codex、Claude Code 和 DeepSeek Harness（dsh）**。
-连接地址、账号和密码保存在本机明文配置中，由 Python CLI 内部读取；AI 使用别名，无需读取真实配置。
+**让 AI 查询 MySQL，无需把数据库账号密码交给 AI。**
+
+连接信息只需在本机配置一次，由本地 CLI 读取并建立连接，返回结果时对当前连接的地址、账号和密码进行脱敏。
+AI 通过别名调用查询，无需打开凭据文件或在对话中接收账密。适用于 **Codex、Claude Code 和 DeepSeek Harness（dsh）**。
 
 ## 功能
 
