@@ -13,15 +13,39 @@ python "<ROOT>/scripts/mysql_skill.py" [--config "<PATH>"] <command> [options]
 | --- | --- | --- |
 | `config list` | None | Alias names only; no connection |
 | `doctor` | `--json` (optional) | Version, dependencies, config presence, aliases, invalid aliases, local readiness; no connection |
-| `query` | `--alias NAME`, one of `--sql SQL` / `--sql-file PATH` | One SELECT or SELECT UNION result |
+| `query` | `--alias NAME`, one of `--sql SQL` / `--sql-file PATH` | One read-only SELECT, SHOW, DESCRIBE, or EXPLAIN SELECT result |
+| `explain` | `--alias NAME`, one of `--sql SQL` / `--sql-file PATH`, optional `--format traditional|json` | Execution plan for the supplied SELECT |
 | `schema` | `--alias NAME`, optional `--table NAME` | Tables, or columns of one table |
 
-`query` and `schema` accept `--limit 1..1000` (default 100) and
+`query`, `explain`, and `schema` accept `--limit 1..1000` (default 100) and
 `--timeout 1..60` seconds (default 15). SQL text and files are limited to 64 KiB.
 Only one statement is supported. Common built-in functions are supported;
-unknown or qualified functions, user variables, writes, locks, executable
+unknown or qualified functions, user-variable assignments, writes, locks, executable
 comments, and file output are rejected. SELECT UNION is supported. CTEs and
 window functions require MySQL 8.0+; JSON functions require 5.7+.
+
+Supported SHOW families: DATABASES, TABLES, COLUMNS, INDEX, CREATE DATABASE,
+CREATE TABLE, CREATE VIEW, TABLE STATUS, VARIABLES, STATUS, WARNINGS, ERRORS,
+PROCESSLIST, ENGINES, COLLATION, and CHARACTER SET. Parsed LIKE/WHERE filters
+and FULL/GLOBAL/SESSION options are supported where MySQL accepts them.
+DESCRIBE/DESC accepts a table. System variables can be read with `@@`.
+
+The function allowlist includes common string, numeric, date, JSON, aggregate,
+window, and connection-information builtins. Unknown functions remain rejected;
+custom stored functions and UDFs are not inferred to be read-only. DDL, DML,
+SET, USE, CALL, GRANT, administrative mutations, file access, and multiple
+statements are rejected. SHOW GRANTS and CREATE USER are excluded.
+
+EXPLAIN accepts SELECT or UNION only, in traditional (MySQL 5.5+) or JSON
+(MySQL 5.6.5+) format. EXPLAIN ANALYZE, EXTENDED, TREE, write-statement plans,
+and FOR CONNECTION are excluded. The `explain` command takes an unprefixed
+SELECT; the `query` command also accepts a complete EXPLAIN SELECT.
+
+SELECT LIMIT is left unchanged for execution plans. `--limit` bounds returned
+plan and metadata rows without rewriting the SQL. JSON plans are returned as a
+string cell under the usual result envelope and remain subject to cell and
+output truncation. SHOW WARNINGS/ERRORS cannot inspect a prior CLI call because
+each invocation opens a new connection.
 
 Queries use a streaming cursor and close the
 connection after collecting at most limit + 1 rows. The top-level SQL LIMIT is
@@ -102,6 +126,6 @@ Do not query credentials or connection metadata to test this against real data.
 Error codes include `invalid_arguments`, `invalid_alias`, `config_not_found`,
 `invalid_config`, `invalid_sql`, `query_rejected`, `sql_file_error`,
 `dependency_missing`, `access_denied`, `query_timeout`, `connection_failed`,
-`connection_lost`, `unsupported_server`, `database_error`, `output_too_large`, `interrupted`, and
+`connection_lost`, `unsupported_server`, `unsupported_feature`, `database_error`, `output_too_large`, `interrupted`, and
 `internal_error`. All errors have `retryable=false`. Raw server messages,
 SQL text, stack traces, and connection arguments are not returned.

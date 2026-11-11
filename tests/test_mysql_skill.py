@@ -93,7 +93,7 @@ class SkillTests(unittest.TestCase):
             "DELETE FROM orders", "SELECT 1; SELECT 2",
             "SELECT * FROM orders FOR UPDATE", "SELECT 1 INTO OUTFILE '/tmp/file'",
             "SELECT SLEEP(1)", "SELECT GET_LOCK('x', 1)", "SELECT RELEASE_LOCK('x')",
-            "SELECT LOAD_FILE('/etc/passwd')", "SELECT @x := 1", "SELECT @@hostname",
+            "SELECT LOAD_FILE('/etc/passwd')", "SELECT @x := 1",
             "SELECT example_app.COUNT(*)", "SELECT arbitrary_udf(1)",
             "/*!50000 SELECT 1 */", "SELECT 1 /*!50000 INTO OUTFILE '/tmp/file' */",
             "WITH x AS (DELETE FROM orders RETURNING id) SELECT * FROM x",
@@ -277,6 +277,98 @@ class SkillTests(unittest.TestCase):
         value, truncated = skill.cell("x" * 4090 + secret, [secret])
         self.assertTrue(truncated)
         self.assertNotIn("unique", value)
+
+    def test_explain_preserves_select_without_injecting_limit(self):
+        for sql in ("SELECT id FROM orders", "SELECT id FROM orders LIMIT 500 OFFSET 7",
+                    "SELECT 1 UNION ALL SELECT 2", "WITH x AS (SELECT 1) SELECT * FROM x"):
+            with self.subTest(sql=sql):
+                expected = skill.validate_sql(sql)
+                self.assertEqual(skill.validate_sql("EXPLAIN " + sql, 1), "EXPLAIN " + expected)
+                self.assertEqual(skill.validate_sql("EXPLAIN FORMAT=JSON " + sql, 1),
+                                 "EXPLAIN FORMAT=JSON " + expected)
+
+    def test_explain_rejects_unsafe_and_executing_forms(self):
+        for sql in ("EXPLAIN DELETE FROM orders", "EXPLAIN UPDATE orders SET id=1",
+                    "EXPLAIN ANALYZE SELECT 1", "EXPLAIN EXTENDED SELECT 1",
+                    "EXPLAIN FORMAT=TREE SELECT 1", "EXPLAIN SELECT SLEEP(1)",
+                    "EXPLAIN SELECT 1; DELETE FROM orders",
+                    "EXPLAIN SELECT @x := 1", "EXPLAIN SELECT * FROM orders FOR UPDATE",
+                    "EXPLAIN SELECT 1 INTO OUTFILE '/tmp/out'",
+                    "EXPLAIN SELECT arbitrary_udf(1)", "EXPLAIN SELECT /*!50000 SLEEP(1) */ 1"):
+            with self.subTest(sql=sql), self.assertRaises(skill.SkillError):
+                skill.validate_sql(sql)
+
+    def test_explain_command_and_query_entrypoints(self):
+        cases = [("explain", ["--sql", "SELECT 1"], "EXPLAIN SELECT 1"),
+                 ("explain", ["--sql", "SELECT 1", "--format", "json"], "EXPLAIN FORMAT=JSON SELECT 1"),
+                 ("query", ["--sql", "EXPLAIN SELECT 1"], "EXPLAIN SELECT 1")]
+        sql_file = Path(self.temp.name) / "plan.sql"
+        sql_file.write_text("SELECT 1", encoding="utf-8")
+        cases.append(("explain", ["--sql-file", str(sql_file)], "EXPLAIN SELECT 1"))
+        for command, args, expected in cases:
+            with self.subTest(command=command, args=args):
+                with patch.object(skill, "execute", return_value={}) as execute:
+                    status, result = self.invoke(command, "--alias", "business", *args)
+                self.assertEqual(status, 0)
+                self.assertEqual(result["operation"], command)
+                self.assertEqual(execute.call_args.args[1], expected)
+
+    def test_explain_rejection_never_connects(self):
+        with patch.object(skill, "execute") as execute:
+            status, result = self.invoke("explain", "--alias", "business", "--sql", "DELETE FROM orders")
+        self.assertEqual(status, 1)
+        self.assertEqual(result["error"]["code"], "query_rejected")
+        execute.assert_not_called()
+
+    def test_common_readonly_sql(self):
+        statements = [
+            "SHOW DATABASES", "SHOW FULL TABLES FROM example_app LIKE 'o%'",
+            "SHOW COLUMNS FROM orders", "SHOW INDEX FROM orders",
+            "SHOW CREATE TABLE orders", "SHOW CREATE VIEW orders_view",
+            "SHOW TABLE STATUS", "SHOW VARIABLES LIKE 'version%'",
+            "SHOW GLOBAL STATUS", "SHOW FULL PROCESSLIST", "SHOW WARNINGS LIMIT 2",
+            "SHOW ERRORS", "SHOW ENGINES", "SHOW COLLATION", "SHOW CHARACTER SET",
+            "DESCRIBE example_app.orders", "DESC orders",
+            "SELECT DATABASE(), VERSION(), CURRENT_USER(), USER(), CONNECTION_ID()",
+            "SELECT @@version, @@session.sql_mode",
+            "SELECT ROW_NUMBER() OVER (ORDER BY id), DENSE_RANK() OVER (ORDER BY id) FROM orders",
+            "SELECT JSON_SET(payload, '$.status', 'ok'), FORMAT(amount, 2) FROM orders",
+        ]
+        for sql in statements:
+            with self.subTest(sql=sql):
+                normalized = skill.validate_sql(sql, 10)
+                self.assertTrue(normalized)
+                if sql.startswith(("SHOW", "DESC")):
+                    self.assertNotIn("LIMIT 11", normalized)
+
+    def test_mutating_and_privileged_sql_remains_rejected(self):
+        statements = [
+            "CREATE TABLE t(id INT)", "ALTER TABLE t ADD COLUMN n INT",
+            "DROP TABLE t", "TRUNCATE TABLE t", "REPLACE INTO t VALUES(1)",
+            "GRANT SELECT ON *.* TO 'someone'@'localhost'", "SET GLOBAL read_only=0",
+            "SET @x=1", "USE other_database", "CALL dangerous_proc()",
+            "LOAD DATA INFILE '/tmp/a' INTO TABLE t", "FLUSH TABLES",
+            "KILL 42", "LOCK TABLES t READ", "ANALYZE TABLE t",
+            "SHOW GRANTS", "SHOW CREATE USER root",
+            "SHOW TABLES WHERE SLEEP(1)", "SHOW TABLES WHERE arbitrary_udf(1)",
+            "SHOW DATABASES; DROP DATABASE t",
+        ]
+        for sql in statements:
+            with self.subTest(sql=sql), patch.object(skill, "execute") as execute:
+                status, _ = self.invoke("query", "--alias", "business", "--sql", sql)
+                self.assertEqual(status, 1)
+                execute.assert_not_called()
+
+    def test_json_explain_requires_supported_server_before_session_sql(self):
+        import pymysql
+        connection = MagicMock()
+        connection.get_server_info.return_value = "5.5.20-log"
+        with patch.object(pymysql, "connect", return_value=connection):
+            with self.assertRaises(skill.SkillError) as caught:
+                skill.execute({}, "EXPLAIN FORMAT=JSON SELECT 1", None, 100, 15)
+        self.assertEqual(caught.exception.code, "unsupported_feature")
+        connection.cursor.assert_not_called()
+        connection.close.assert_called_once()
 
     def test_cli_subprocess_contract(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts" / "mysql_skill.py"),

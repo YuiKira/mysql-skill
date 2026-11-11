@@ -17,7 +17,7 @@ import time
 import uuid
 import warnings
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_SQL_BYTES = 64 * 1024
 MAX_CELL_CHARS = 4096
@@ -41,8 +41,24 @@ SUBDATE SUBSTR SUBSTRING SUBSTRING_INDEX SUM TAN TIME TIMEDIFF TIMESTAMP
 TIMESTAMPADD TIMESTAMPDIFF TIME_FORMAT TIME_TO_SEC TIME_TO_STR TO_DAYS TRIM TRUNCATE
 TS_OR_DS_TO_DATE TS_OR_DS_TO_TIMESTAMP
 UCASE UNHEX UNIX_TIMESTAMP UPPER VARIANCE VAR_POP VAR_SAMP WEEK WEEKDAY
-WEEKOFYEAR YEAR YEARWEEK
+WEEKOFYEAR YEAR YEARWEEK CURRENT_SCHEMA CURRENT_VERSION CURRENT_USER
+DATABASE VERSION USER SESSION_USER SYSTEM_USER CONNECTION_ID CHAR CHR
+CONCAT_WS CURRENT_DATETIME DATE_FROM_PARTS DATE_TO_DATE_STR DATE_TO_DI
+FORMAT NUMBER_TO_STR FROM_BASE64 TO_BASE64 UUID UUID_TO_BIN BIN_TO_UUID IS_UUID
+REGEXP_LIKE REGEXP_REPLACE REGEXP_INSTR REGEXP_SUBSTR REGEXP_EXTRACT
+STR_TO_TIME STR_TO_DATE DATE_TO_STR TIME_TO_UNIX UNIX_TO_TIME UNIX_TO_STR
+JSON_ARRAY_APPEND JSON_ARRAY_INSERT JSON_DEPTH JSON_INSERT JSON_MERGE
+JSON_MERGE_PATCH JSON_MERGE_PRESERVE JSON_PRETTY JSON_REMOVE JSON_REPLACE
+JSON_SEARCH JSON_SET JSON_STORAGE_FREE JSON_STORAGE_SIZE JSON_VALUE
+JSON_CONTAINS_PATH JSON_EXTRACT_SCALAR JSON_FORMAT JSON_PARSE
+CUME_DIST PERCENTILE_CONT PERCENTILE_DISC TIMESTAMP_TRUNC TIMESTAMP_DIFF
+IS_ASCII STARTS_WITH ENDS_WITH BITWISE_AND_AGG BITWISE_OR_AGG
 """.split())
+SAFE_SHOW = frozenset({
+    "DATABASES", "TABLES", "COLUMNS", "INDEX", "CREATE DATABASE",
+    "CREATE TABLE", "CREATE VIEW", "TABLE STATUS", "VARIABLES", "STATUS",
+    "WARNINGS", "ERRORS", "PROCESSLIST", "ENGINES", "COLLATION", "CHARACTER SET",
+})
 
 
 class SkillError(Exception):
@@ -64,15 +80,17 @@ def parser():
     config.add_subparsers(dest="config_command", required=True).add_parser("list")
     doctor = commands.add_parser("doctor", help="Inspect local readiness without connecting")
     doctor.add_argument("--json", action="store_true", help="JSON is always enabled")
-    for name in ("query", "schema"):
+    for name in ("query", "explain", "schema"):
         command = commands.add_parser(name)
         command.add_argument("--alias", required=True)
         command.add_argument("--limit", type=int, default=100)
         command.add_argument("--timeout", type=int, default=15)
-        if name == "query":
+        if name in ("query", "explain"):
             sql = command.add_mutually_exclusive_group(required=True)
             sql.add_argument("--sql")
             sql.add_argument("--sql-file", type=Path)
+            if name == "explain":
+                command.add_argument("--format", choices=("traditional", "json"), default="traditional")
         else:
             command.add_argument("--table")
     return root
@@ -146,11 +164,34 @@ def validate_sql(sql, row_limit=None):
         statements = [item for item in statements if item is not None and not isinstance(item, exp.Semicolon)]
     except Exception:
         raise SkillError("invalid_sql", "Cannot parse the query as MySQL SQL.") from None
-    if len(statements) != 1 or not isinstance(statements[0], (exp.Select, exp.Union)):
-        raise SkillError("query_rejected", "Only one SELECT or SELECT UNION statement is supported.")
-    for node in statements[0].walk():
+    if len(statements) != 1:
+        raise SkillError("query_rejected", "Only one SELECT or EXPLAIN SELECT statement is supported.")
+    tree = statements[0]
+    explain_prefix = None
+    metadata_statement = False
+    if isinstance(tree, exp.Show):
+        if tree.name.upper() not in SAFE_SHOW or tree.args.get("into_outfile"):
+            raise SkillError("query_rejected", "This SHOW operation is not supported.")
+        metadata_statement = True
+    if isinstance(tree, exp.Describe):
+        if any(value for key, value in tree.args.items() if key not in ("this", "format")):
+            raise SkillError("query_rejected", "EXPLAIN options other than FORMAT are not supported.")
+        format_node = tree.args.get("format")
+        if format_node is not None and not isinstance(format_node, exp.FileFormatProperty):
+            raise SkillError("query_rejected", "Unsupported EXPLAIN format syntax.")
+        plan_format = format_node.this.name.upper() if isinstance(format_node, exp.FileFormatProperty) else "TRADITIONAL"
+        if plan_format not in ("TRADITIONAL", "JSON"):
+            raise SkillError("query_rejected", "Only traditional and JSON EXPLAIN formats are supported.")
+        if isinstance(tree.this, exp.Table) and format_node is None:
+            metadata_statement = True
+        else:
+            explain_prefix = "EXPLAIN FORMAT=JSON " if plan_format == "JSON" else "EXPLAIN "
+            tree = tree.this
+    if not metadata_statement and not isinstance(tree, (exp.Select, exp.Union)):
+        raise SkillError("query_rejected", "Only SELECT, SHOW, DESCRIBE, or EXPLAIN SELECT is supported.")
+    for node in tree.walk():
         if isinstance(node, (exp.Into, exp.Lock, exp.Command, exp.DDL, exp.DML,
-                             exp.Parameter, exp.SessionParameter)):
+                             exp.Parameter)):
             raise SkillError("query_rejected", "Writes, locks, variables, and output files are not supported.")
         if isinstance(node, exp.Func):
             name = node.name.upper() if isinstance(node, exp.Anonymous) else node.sql_name()
@@ -158,15 +199,14 @@ def validate_sql(sql, row_limit=None):
                 raise SkillError("query_rejected", "The query contains an unsupported function.")
             if isinstance(node.parent, exp.Dot):
                 raise SkillError("query_rejected", "Qualified function calls are not supported.")
-    tree = statements[0]
-    if row_limit is not None:
+    if row_limit is not None and explain_prefix is None and not metadata_statement:
         existing = tree.args.get("limit")
         expression = existing.expression if existing else None
         cap = row_limit + 1
         if isinstance(expression, exp.Literal) and expression.is_int:
             cap = min(cap, max(0, int(expression.this)))
         tree.limit(cap, copy=False)
-    return tree.sql(dialect="mysql")
+    return (explain_prefix or "") + tree.sql(dialect="mysql")
 
 
 def dependency_status():
@@ -226,6 +266,8 @@ def execute(options, sql, params, limit, timeout):
     try:
         connection = pymysql.connect(**options, cursorclass=pymysql.cursors.SSCursor)
         capabilities = server_capabilities(connection.get_server_info())
+        if sql.startswith("EXPLAIN FORMAT=JSON ") and tuple(map(int, capabilities["server_version"].split("."))) < (5, 6, 5):
+            raise SkillError("unsupported_feature", "JSON EXPLAIN requires MySQL 5.6.5 or newer; use traditional format.")
         with connection.cursor() as cursor:
             if capabilities["server_timeout"]:
                 cursor.execute("SET SESSION MAX_EXECUTION_TIME = %s", (timeout * 1000,))
@@ -285,7 +327,7 @@ def run(args, secrets):
     secrets.extend(options[key] for key in ("host", "user", "password") if options[key])
     require_dependencies()
     params = None
-    if args.command == "query":
+    if args.command in ("query", "explain"):
         try:
             if args.sql_file:
                 if args.sql_file.stat().st_size > MAX_SQL_BYTES:
@@ -295,6 +337,9 @@ def run(args, secrets):
                 sql = args.sql
         except (OSError, UnicodeError):
             raise SkillError("sql_file_error", "Cannot read the SQL file.") from None
+        if args.command == "explain":
+            prefix = "EXPLAIN FORMAT=JSON " if args.format == "json" else "EXPLAIN "
+            sql = prefix + sql
         sql = validate_sql(sql, args.limit)
     elif args.table:
         sql = ("SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA "

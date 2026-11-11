@@ -1,6 +1,6 @@
 ---
 name: mysql-skill
-description: "Use when a task requires connecting to MySQL by alias, querying database records, inspecting live MySQL tables or columns, or diagnosing MySQL connection readiness; Chinese triggers include MySQL, 数据库别名, 查库, 查询数据, 表结构. Do not use for SQL drafting without database access, other database engines, or SSH transport itself."
+description: "Use when a task requires connecting to MySQL by alias, read-only SQL, SHOW or DESCRIBE metadata, EXPLAIN query plans, or diagnosing MySQL connection readiness; Chinese triggers include MySQL, 数据库别名, 查库, 查询数据, 表结构, 执行计划. Do not use for SQL drafting without database access, other database engines, or SSH transport itself."
 ---
 
 # MySQL Skill
@@ -8,8 +8,8 @@ description: "Use when a task requires connecting to MySQL by alias, querying da
 ## Scope
 
 Use the shared Python CLI with Codex, Claude Code, or DeepSeek Harness.
-Support direct MySQL 5.5+ connections, read-only SELECT queries, table discovery,
-column inspection, and local diagnostics. MySQL 8.0+ is recommended.
+Support direct MySQL 5.5+ connections, read-only SELECT queries, SHOW metadata,
+DESCRIBE tables, EXPLAIN SELECT plans, and local diagnostics. MySQL 8.0+ is recommended.
 Writes, migrations, stored procedures, and MariaDB are outside this version.
 
 ## Hard Rules
@@ -38,6 +38,16 @@ Writes, migrations, stored procedures, and MariaDB are outside this version.
    at limit + 1; scanned rows, sorting, and aggregation can still exceed this cap.
 4. Report results, truncation, and actionable errors. Never quote connection details.
 
+For execution plans, use `explain --sql "SELECT ..."` or
+`query --sql "EXPLAIN SELECT ..."`. Use `--format json` on MySQL 5.6.5+
+when a JSON plan is needed. Preserve the query's own LIMIT; the CLI does not
+inject a LIMIT into explained SQL. `--limit` caps returned plan rows only.
+Never use EXPLAIN ANALYZE, write-statement plans, or arbitrary stored functions.
+SHOW GRANTS and SHOW CREATE USER are excluded to avoid credential material.
+SHOW PROCESSLIST and VARIABLES can contain sensitive operational data; request
+only the authorized scope. SHOW WARNINGS and ERRORS describe the fresh connection,
+not a previous CLI request. Session variables can be read with `@@`, not assigned.
+
 Do not run doctor or a connection test before every query. Use doctor only for
 missing configuration, dependencies, or interpreter ambiguity. It opens no connection.
 
@@ -52,6 +62,8 @@ on macOS/Linux use `python3` or the configured virtual environment interpreter.
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" schema --alias example
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" schema --alias example --table orders
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" query --alias example --sql "SELECT id FROM orders ORDER BY id DESC LIMIT 10"
+<PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" query --alias example --sql "SHOW TABLES"
+<PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" explain --alias example --sql "SELECT id FROM orders WHERE id = 42"
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" doctor --json
 ```
 
@@ -87,7 +99,7 @@ Stdout contains one JSON document with `schema_version`, `success`, `operation`,
 `data`, `error`, and `meta`. Failures exit 1 and include an error code and
 `retryable=false`. Help exits 0 with human-readable usage.
 
-Query and schema data contain `columns`, `rows`, `row_count`, `truncated`, and
+Query, explain, and schema data contain `columns`, `rows`, `row_count`, `truncated`, and
 `cells_truncated`, and `execution`. Execution reports the normalized numeric
 server version, read-only transaction availability, timeout mode, and effective
 timeout seconds. Version suffixes such as `-log` are accepted and omitted from
@@ -114,6 +126,7 @@ CTEs and window functions require MySQL 8.0+, and JSON functions require 5.7+.
 - `query_timeout` / `connection_lost`: stop; narrow scope or verify server state before a new user-authorized query.
 - `connection_failed`: report the alias and ask the user to check local connection settings or tunnel state.
 - `unsupported_server`: MySQL 5.5+ is required; MariaDB remains unsupported.
+- `unsupported_feature`: JSON EXPLAIN requires MySQL 5.6.5+; use traditional format.
 
 ## Harness Installation
 

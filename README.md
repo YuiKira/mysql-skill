@@ -9,11 +9,15 @@
 
 - 查询数据：单条只读 `SELECT` 和 `UNION`，MySQL 8.0+ 可使用 CTE。
 - 查看结构：列出表、查看指定表的字段。
+- 常用只读 SQL：`SHOW`、`DESCRIBE`、系统变量读取，以及常用查询函数。
+- 执行计划：`EXPLAIN SELECT`，支持传统格式和 JSON 格式，不支持 `EXPLAIN ANALYZE`。
 - 别名发现与本地诊断：不输出连接详情，不建立诊断连接。
 - 统一 JSON 输出、凭据脱敏、查询超时、行数和输出大小限制。
 - 支持 Windows、macOS 和 Linux，要求 Python 3.10+、MySQL 5.5+，建议 MySQL 8.0+。
 
 当前版本不支持写操作、迁移、存储过程和 MariaDB。
+建表、删表、授权、SET、CALL、文件读写和多语句同样会拦截。函数仍使用允许列表，
+不会将未知存储函数或 UDF 当成安全查询。`SHOW GRANTS`、`SHOW CREATE USER` 不开放。
 
 ### MySQL 版本兼容
 
@@ -120,7 +124,18 @@ python3 -m venv .venv
 <PYTHON> "scripts/mysql_skill.py" schema --alias business --table orders
 <PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SELECT id, status FROM orders ORDER BY id DESC LIMIT 10"
 <PYTHON> "scripts/mysql_skill.py" query --alias business --sql-file "query.sql" --limit 100 --timeout 15
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SHOW TABLES"
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "DESCRIBE orders"
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SHOW INDEX FROM orders"
+<PYTHON> "scripts/mysql_skill.py" explain --alias business --sql "SELECT id FROM orders WHERE id = 42"
+<PYTHON> "scripts/mysql_skill.py" explain --alias business --sql-file "query.sql" --format json
 ```
+
+也可以用 `query --sql "EXPLAIN SELECT ..."`。传统执行计划兼容 MySQL 5.5+，
+JSON 格式需要 MySQL 5.6.5+。执行计划保留原 SQL 的 LIMIT；`--limit` 只限制返回的
+计划行数。SHOW/DESCRIBE 不追加 SQL LIMIT，返回结果仍受行数和输出大小限制。
+JSON 计划作为文本单元格返回，可能被截断，请检查 `cells_truncated`。
+每次调用使用独立连接，SHOW WARNINGS/ERRORS 无法查看上次调用的诊断信息。
 
 默认返回 100 行，最多 1,000 行；`--timeout` 默认为 15 秒，最多 60 秒。MySQL 5.7.8+ 将其用于服务端 SELECT 超时；所有版本的客户端读取超时为该值加 5 秒，属于单次读取等待限制，并非整体执行期限。CLI 同时将 SQL 的顶层 `LIMIT` 收紧到返回上限加 1，保留更小的原有上限和偏移。扫描、排序和聚合仍可能处理更多行。
 

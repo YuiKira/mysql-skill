@@ -10,11 +10,16 @@ internally from a local file. The agent uses aliases without opening that file.
 
 - Read-only SELECT and UNION queries; CTEs on MySQL 8.0+.
 - Table discovery and column inspection.
+- Common read-only SQL: SHOW, DESCRIBE, system variable reads, and common query functions.
+- EXPLAIN SELECT plans in traditional or JSON format; EXPLAIN ANALYZE is excluded.
 - Alias listing and local diagnostics without exposing connection details.
 - JSON output, credential redaction, query timeouts, and bounded results.
 - Windows, macOS, and Linux; Python 3.10+ and MySQL 5.5+ required. MySQL 8.0+ recommended.
 
 This version excludes writes, migrations, stored procedures, and MariaDB.
+DDL, grants, SET, CALL, file access, and multiple statements are also rejected.
+Functions remain allowlisted; unknown stored functions and UDFs are not assumed
+safe. SHOW GRANTS and SHOW CREATE USER are excluded.
 
 ### MySQL Compatibility
 
@@ -138,7 +143,19 @@ Replace `<PYTHON>` with the virtual environment interpreter:
 <PYTHON> "scripts/mysql_skill.py" schema --alias business --table orders
 <PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SELECT id, status FROM orders ORDER BY id DESC LIMIT 10"
 <PYTHON> "scripts/mysql_skill.py" query --alias business --sql-file "query.sql" --limit 100 --timeout 15
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SHOW TABLES"
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "DESCRIBE orders"
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SHOW INDEX FROM orders"
+<PYTHON> "scripts/mysql_skill.py" explain --alias business --sql "SELECT id FROM orders WHERE id = 42"
+<PYTHON> "scripts/mysql_skill.py" explain --alias business --sql-file "query.sql" --format json
 ```
+
+`query --sql "EXPLAIN SELECT ..."` is also supported. Traditional plans work
+on MySQL 5.5+; JSON requires 5.6.5+. Explained SELECT limits are preserved;
+`--limit` only bounds returned plan rows. SHOW/DESCRIBE do not receive an
+injected SQL LIMIT, but result row and output limits still apply. JSON plans
+are text cells and may be truncated; inspect `cells_truncated`. Each call
+opens a fresh connection, so SHOW WARNINGS/ERRORS cannot inspect a previous call.
 
 The default returned row limit is 100, maximum 1,000. `--timeout` defaults to
 15 seconds, maximum 60. MySQL 5.7.8+ uses it for the server SELECT timeout.
