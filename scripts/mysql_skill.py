@@ -265,11 +265,14 @@ def ssh_tunnel(via, options, notices):
     if not re.fullmatch(r"[\w.-]{1,64}", via) or via.startswith("-"):
         raise SkillError("invalid_arguments", "Use a valid SSH alias with --via.")
     command = ssh_command()
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        local_port = reservation.getsockname()[1]
     data = call_ssh(command, ["start", via, "--remote-host", options["host"],
-                              "--remote-port", str(options["port"])])
+                              "--remote-port", str(options["port"]), "--local-port", str(local_port)])
     port = data.get("local_port")
     tunnel_id = data.get("tunnel_id")
-    if type(port) is not int or not 1 <= port <= 65535 or tunnel_id != f"{via}-{port}":
+    if type(port) is not int or port != local_port or tunnel_id != f"{via}-{port}":
         raise SkillError("ssh_tunnel_unknown", "SSH skill returned an invalid tunnel endpoint; inspect SSH tunnel list before retrying.")
     try:
         yield port
