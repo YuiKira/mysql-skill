@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import decimal
 import importlib.util
@@ -12,12 +13,14 @@ import logging
 import os
 from pathlib import Path
 import re
+import socket
+import subprocess
 import sys
 import time
 import uuid
 import warnings
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_SQL_BYTES = 64 * 1024
 MAX_CELL_CHARS = 4096
@@ -83,6 +86,7 @@ def parser():
     for name in ("query", "explain", "schema"):
         command = commands.add_parser(name)
         command.add_argument("--alias", required=True)
+        command.add_argument("--via", help="SSH skill alias for a temporary tunnel")
         command.add_argument("--limit", type=int, default=100)
         command.add_argument("--timeout", type=int, default=15)
         if name in ("query", "explain"):
@@ -218,6 +222,64 @@ def require_dependencies():
         raise SkillError("dependency_missing", "Install requirements.txt with the Python interpreter used for this CLI.")
 
 
+def ssh_command():
+    configured = os.environ.get("MYSQL_SKILL_SSH_ROOT")
+    roots = [Path(configured)] if configured else [
+        Path(__file__).resolve().parents[2] / "ssh-skill",
+        *(Path.home() / directory / "skills" / "ssh-skill"
+          for directory in (".agents", ".codex", ".claude", ".dsh")),
+    ]
+    for root in roots:
+        script = root / "scripts" / "ssh_skill.py"
+        if script.is_file():
+            python = os.environ.get("MYSQL_SKILL_SSH_PYTHON")
+            if not python:
+                venv = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+                python = str(venv) if venv.is_file() else sys._base_executable
+            return [python, str(script)]
+    raise SkillError("ssh_skill_missing", "Install SSH skill v4 or set MYSQL_SKILL_SSH_ROOT to its directory.")
+
+
+def call_ssh(command, arguments):
+    try:
+        process = subprocess.run([*command, "tunnel", *arguments], capture_output=True,
+                                 encoding="utf-8", errors="replace", timeout=45,
+                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except subprocess.TimeoutExpired:
+        raise SkillError("ssh_tunnel_unknown", "SSH tunnel operation timed out; inspect SSH tunnel list before retrying.") from None
+    except OSError:
+        raise SkillError("ssh_unavailable", "Cannot run the SSH skill interpreter; check MYSQL_SKILL_SSH_PYTHON.") from None
+    try:
+        result = json.loads(process.stdout)
+    except ValueError:
+        raise SkillError("ssh_tunnel_failed", "SSH skill returned an invalid result; check its runtime and dependencies.") from None
+    if (not isinstance(result, dict) or result.get("schema_version") != "1.0"
+            or process.returncode != 0 or result.get("success") is not True
+            or not isinstance(result.get("data"), dict)):
+        raise SkillError("ssh_tunnel_failed", "SSH tunnel operation failed; check the SSH alias, runtime, and network.")
+    return result["data"]
+
+
+@contextmanager
+def ssh_tunnel(via, options, notices):
+    if not re.fullmatch(r"[\w.-]{1,64}", via) or via.startswith("-"):
+        raise SkillError("invalid_arguments", "Use a valid SSH alias with --via.")
+    command = ssh_command()
+    data = call_ssh(command, ["start", via, "--remote-host", options["host"],
+                              "--remote-port", str(options["port"])])
+    port = data.get("local_port")
+    tunnel_id = data.get("tunnel_id")
+    if type(port) is not int or not 1 <= port <= 65535 or tunnel_id != f"{via}-{port}":
+        raise SkillError("ssh_tunnel_unknown", "SSH skill returned an invalid tunnel endpoint; inspect SSH tunnel list before retrying.")
+    try:
+        yield port
+    finally:
+        try:
+            call_ssh(command, ["stop", tunnel_id])
+        except SkillError:
+            notices.append(f"SSH tunnel cleanup was not confirmed; inspect or stop tunnel {tunnel_id} with SSH skill.")
+
+
 def cell(value, secrets=()):
     truncated = False
     if isinstance(value, bytes):
@@ -259,12 +321,21 @@ def server_capabilities(server_info):
             "server_timeout": version >= (5, 7, 8)}
 
 
-def execute(options, sql, params, limit, timeout):
+def execute(options, sql, params, limit, timeout, tunnel_port=None):
     import pymysql
 
     connection = None
     try:
-        connection = pymysql.connect(**options, cursorclass=pymysql.cursors.SSCursor)
+        if tunnel_port is None:
+            connection = pymysql.connect(**options, cursorclass=pymysql.cursors.SSCursor)
+        else:
+            # Preserve the configured hostname for TLS verification and redaction.
+            connection = pymysql.connect(**options, cursorclass=pymysql.cursors.SSCursor, defer_connect=True)
+            try:
+                sock = socket.create_connection(("127.0.0.1", tunnel_port), options["connect_timeout"])
+            except OSError:
+                raise SkillError("connection_failed", "Cannot connect to the local SSH tunnel.") from None
+            connection.connect(sock=sock)
         capabilities = server_capabilities(connection.get_server_info())
         if sql.startswith("EXPLAIN FORMAT=JSON ") and tuple(map(int, capabilities["server_version"].split("."))) < (5, 6, 5):
             raise SkillError("unsupported_feature", "JSON EXPLAIN requires MySQL 5.6.5 or newer; use traditional format.")
@@ -301,7 +372,7 @@ def execute(options, sql, params, limit, timeout):
                 pass
 
 
-def run(args, secrets):
+def run(args, secrets, notices):
     path = config_path(args)
     if args.command == "doctor":
         dependencies = dependency_status()
@@ -350,6 +421,9 @@ def run(args, secrets):
         sql = ("SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
                "WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME LIMIT %s")
         params = (options["database"], args.limit + 1)
+    if args.via:
+        with ssh_tunnel(args.via, options, notices) as port:
+            return execute(options, sql, params, args.limit, args.timeout, tunnel_port=port)
     return execute(options, sql, params, args.limit, args.timeout)
 
 
@@ -386,6 +460,7 @@ def bound_output(result):
 def main(argv=None):
     started = time.monotonic()
     secrets = []
+    notices = []
     result = {"schema_version": "1.0", "success": False, "operation": "unknown", "data": None,
               "error": None, "meta": {"request_id": str(uuid.uuid4()), "elapsed_ms": 0}}
     try:
@@ -393,7 +468,7 @@ def main(argv=None):
         result["operation"] = "config.list" if args.command == "config" else args.command
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            result["data"] = run(args, secrets)
+            result["data"] = run(args, secrets, notices)
         result["success"] = True
     except SkillError as error:
         result["error"] = {"code": error.code, "message": str(error), "retryable": False}
@@ -402,6 +477,8 @@ def main(argv=None):
     except Exception:
         result["error"] = {"code": "internal_error", "message": "Operation failed; raw diagnostics are suppressed.", "retryable": False}
     result["meta"]["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+    if notices:
+        result["meta"]["warnings"] = notices
     result["data"] = redact(result["data"], secrets)
     result = bound_output(result)
     print(encode_result(result))

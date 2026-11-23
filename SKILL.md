@@ -1,6 +1,6 @@
 ---
 name: mysql-skill
-description: "Use when a task requires connecting to MySQL by alias, read-only SQL, SHOW or DESCRIBE metadata, EXPLAIN query plans, or diagnosing MySQL connection readiness; Chinese triggers include MySQL, 数据库别名, 查库, 查询数据, 表结构, 执行计划. Do not use for SQL drafting without database access, other database engines, or SSH transport itself."
+description: "Use for MySQL access by alias, directly or through an SSH alias, read-only SQL, metadata, EXPLAIN, and connection diagnostics; Chinese triggers include MySQL, 数据库别名, 查库, 查询数据, 表结构, 执行计划, 通过跳板机查库. Do not use for SQL drafting without database access, other database engines, or standalone SSH work."
 ---
 
 # MySQL Skill
@@ -8,7 +8,7 @@ description: "Use when a task requires connecting to MySQL by alias, read-only S
 ## Scope
 
 Use the shared Python CLI with Codex, Claude Code, or DeepSeek Harness.
-Support direct MySQL 5.5+ connections, read-only SELECT queries, SHOW metadata,
+Support direct or SSH-tunneled MySQL 5.5+ connections, read-only SELECT queries, SHOW metadata,
 DESCRIBE tables, EXPLAIN SELECT plans, and local diagnostics. MySQL 8.0+ is recommended.
 Writes, migrations, stored procedures, and MariaDB are outside this version.
 
@@ -32,6 +32,8 @@ Writes, migrations, stored procedures, and MariaDB are outside this version.
 
 1. Identify the alias and requested data scope. List aliases once if unknown;
    ask the user if several aliases could match. Do not guess a production target.
+   If the user specifies an SSH server, pass its alias with `--via` on every
+   query, schema, and explain call. Do not try direct access first.
 2. Use `schema` when table or column names are unknown. Inspect only relevant tables.
 3. Run the smallest useful SELECT. Select necessary columns and add SQL filters
    and a SQL LIMIT when appropriate. CLI `--limit` caps the top-level SQL LIMIT
@@ -53,9 +55,13 @@ missing configuration, dependencies, or interpreter ambiguity. It opens no conne
 
 ## Invocation
 
-Use an available Python 3.10+ interpreter with `requirements.txt` installed.
-Pass each argument separately and quote local paths. On Windows use `python`;
-on macOS/Linux use `python3` or the configured virtual environment interpreter.
+Prefer the loaded skill's own Python: `<MYSQL_SKILL_ROOT>/.venv/Scripts/python.exe`
+on Windows, or `<MYSQL_SKILL_ROOT>/.venv/bin/python` on macOS/Linux. Check that
+path before choosing a system interpreter. If absent, use Python 3.10+ with
+`requirements.txt` installed. On `dependency_missing`, check the skill's virtual
+environment before installing anything. Reuse the chosen interpreter for the task.
+Pass each argument separately and quote local paths. In PowerShell use `&`
+before a quoted interpreter path.
 
 ```text
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" config list
@@ -63,6 +69,7 @@ on macOS/Linux use `python3` or the configured virtual environment interpreter.
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" schema --alias example --table orders
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" query --alias example --sql "SELECT id FROM orders ORDER BY id DESC LIMIT 10"
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" query --alias example --sql "SHOW TABLES"
+<PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" query --alias example --via jump --sql "SELECT 1"
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" explain --alias example --sql "SELECT id FROM orders WHERE id = 42"
 <PYTHON> "<MYSQL_SKILL_ROOT>/scripts/mysql_skill.py" doctor --json
 ```
@@ -89,9 +96,20 @@ READ ONLY transactions on MySQL 5.6.5+. MySQL 5.5 and 5.6.0-5.6.4 lack that
 transaction mode; database grants enforce the account's read-only boundary.
 The CLI has no write override.
 
-For SSH-only targets, use the installed SSH skill to establish an authorized
-loopback tunnel, then use a locally configured MySQL alias for its endpoint.
-Do not load the SSH configuration or transfer its secrets into SQL commands.
+For SSH-only targets, use `--via <SSH_ALIAS>` with the existing database alias.
+The CLI reads its destination internally, calls SSH skill v4 to create a private
+loopback tunnel, connects through it, and stops that tunnel after the operation.
+Keep the database alias configured for the destination reachable from the SSH host;
+do not change it to localhost or ask the user to rewrite it for each tunnel.
+Do not run remote `mysql`, copy credentials to the server, or construct another
+database client. SSH skill handles alias discovery when needed; its CLI output
+is captured internally during database operations. Do not read either real config.
+
+SSH skill discovery prefers a sibling `ssh-skill`, then standard personal
+`.agents`, `.codex`, `.claude`, and `.dsh` skill directories. Custom installations
+can set `MYSQL_SKILL_SSH_ROOT`. The SSH interpreter is selected separately:
+`MYSQL_SKILL_SSH_PYTHON`, the SSH skill's own `.venv`, then the current Python's
+base interpreter. See the command reference for setup and failure handling.
 
 ## Result Contract
 
@@ -125,6 +143,10 @@ CTEs and window functions require MySQL 8.0+, and JSON functions require 5.7+.
 - `access_denied`: ask the user to fix the local account or grants; do not expose raw diagnostics.
 - `query_timeout` / `connection_lost`: stop; narrow scope or verify server state before a new user-authorized query.
 - `connection_failed`: report the alias and ask the user to check local connection settings or tunnel state.
+- `ssh_skill_missing` / `ssh_unavailable`: fix SSH skill installation or its interpreter.
+- `ssh_tunnel_failed`: check the SSH alias, dependencies, and network; do not fall back to direct or remote SQL.
+- `ssh_tunnel_unknown`: inspect SSH tunnel state before another attempt; do not retry automatically.
+- `meta.warnings`: disclose unconfirmed cleanup and use the named tunnel ID with SSH skill for recovery.
 - `unsupported_server`: MySQL 5.5+ is required; MariaDB remains unsupported.
 - `unsupported_feature`: JSON EXPLAIN requires MySQL 5.6.5+; use traditional format.
 

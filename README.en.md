@@ -17,6 +17,7 @@ opening the credential file or receiving credentials in chat. Works with
 - Common read-only SQL: SHOW, DESCRIBE, system variable reads, and common query functions.
 - EXPLAIN SELECT plans in traditional or JSON format; EXPLAIN ANALYZE is excluded.
 - Alias listing and local diagnostics without exposing connection details.
+- SSH access by server alias, with automatic local tunnel setup and cleanup.
 - JSON output, credential redaction, query timeouts, and bounded results.
 - Windows, macOS, and Linux; Python 3.10+ and MySQL 5.5+ required. MySQL 8.0+ recommended.
 
@@ -90,7 +91,8 @@ python3 -m venv .venv
 ".venv/bin/python" "scripts/mysql_skill.py" doctor --json
 ```
 
-Have the agent invoke the CLI with that environment's Python. Reload skills
+The agent prefers the skill's own virtual environment to avoid missing dependencies
+in a system Python. Reload skills
 or start a new session if the tool has not discovered the installation.
 
 ## Local Configuration
@@ -123,8 +125,19 @@ Override the location with `MYSQL_SKILL_CONFIG` or the global
 
 For direct network connections, add verified TLS:
 `"tls": {"ca": "/local/path/ca.pem"}`. Add paired `cert` and `key` paths for
-client certificates. Without `tls`, TLS is not requested. For SSH-only targets,
-use the SSH skill to establish a local tunnel, then use a preconfigured MySQL alias.
+client certificates. Without `tls`, TLS is not requested.
+
+For SSH-only targets, install SSH skill v4 and add `--via <SSH_ALIAS>` to the
+database command. Keep the database alias configured for the destination reachable
+from the SSH server; no localhost rewrite is needed. The CLI creates a local tunnel,
+runs the query, and cleans up without sending database credentials or SQL to the
+server. TLS still verifies the original database hostname.
+
+Discovery checks a sibling `ssh-skill`, then personal `.agents`, `.codex`, `.claude`,
+and `.dsh` skill directories. Override with `MYSQL_SKILL_SSH_ROOT`. Set
+`MYSQL_SKILL_SSH_PYTHON` for a separate SSH interpreter. Otherwise the SSH skill's
+own `.venv` is preferred, followed by the current Python's base interpreter.
+SSH dependencies must be installed in its chosen environment.
 
 The skill keeps credentials outside normal agent workflows; it does not enforce
 OS file isolation. Exact configured host, username, and password strings are
@@ -138,6 +151,8 @@ Ask the agent, for example:
 > Use the business MySQL alias to list order tables.
 >
 > Query the latest 10 failed orders in business; return only order ID, status, and creation time.
+>
+> Inspect the business order table through the jump SSH server.
 
 Replace `<PYTHON>` with the virtual environment interpreter:
 
@@ -152,7 +167,18 @@ Replace `<PYTHON>` with the virtual environment interpreter:
 <PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SHOW INDEX FROM orders"
 <PYTHON> "scripts/mysql_skill.py" explain --alias business --sql "SELECT id FROM orders WHERE id = 42"
 <PYTHON> "scripts/mysql_skill.py" explain --alias business --sql-file "query.sql" --format json
+<PYTHON> "scripts/mysql_skill.py" query --alias business --via jump --sql "SELECT 1"
+<PYTHON> "scripts/mysql_skill.py" schema --alias business --via jump --table orders
+<PYTHON> "scripts/mysql_skill.py" explain --alias business --via jump --sql "SELECT id FROM orders WHERE id = 42"
 ```
+
+`--via` works with `query`, `schema`, and `explain`. Each call creates and cleans up
+its own tunnel without changing database configuration. Raw SSH output is captured
+internally. Tunnel process arguments contain the destination address, but no database
+username or password. Unconfirmed cleanup appears in `meta.warnings` with the tunnel
+ID; the query result or original error is retained. SSH operations have a separate
+45-second timeout. Inspect tunnel state after a timeout; no automatic retry or
+remote SQL fallback occurs.
 
 `query --sql "EXPLAIN SELECT ..."` is also supported. Traditional plans work
 on MySQL 5.5+; JSON requires 5.6.5+. Explained SELECT limits are preserved;

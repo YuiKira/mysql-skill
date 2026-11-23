@@ -17,7 +17,8 @@ python "<ROOT>/scripts/mysql_skill.py" [--config "<PATH>"] <command> [options]
 | `explain` | `--alias NAME`, one of `--sql SQL` / `--sql-file PATH`, optional `--format traditional|json` | Execution plan for the supplied SELECT |
 | `schema` | `--alias NAME`, optional `--table NAME` | Tables, or columns of one table |
 
-`query`, `explain`, and `schema` accept `--limit 1..1000` (default 100) and
+`query`, `explain`, and `schema` accept optional `--via SSH_ALIAS`,
+`--limit 1..1000` (default 100), and
 `--timeout 1..60` seconds (default 15). SQL text and files are limited to 64 KiB.
 Only one statement is supported. Common built-in functions are supported;
 unknown or qualified functions, user-variable assignments, writes, locks, executable
@@ -95,6 +96,38 @@ certificate and hostname verification are enabled. Optional client `cert` and
 `key` paths must be supplied together. Without `tls`, no TLS is requested.
 Use verified TLS for direct network connections, or an authorized SSH tunnel.
 
+## SSH Access
+
+Use the existing database alias and an installed SSH skill v4 alias:
+
+```text
+<PYTHON> "<ROOT>/scripts/mysql_skill.py" query --alias business --via jump --sql "SELECT 1"
+<PYTHON> "<ROOT>/scripts/mysql_skill.py" schema --alias business --via jump --table orders
+<PYTHON> "<ROOT>/scripts/mysql_skill.py" explain --alias business --via jump --sql "SELECT id FROM orders WHERE id = 42"
+```
+
+The configured database host and port are resolved from the SSH server. The CLI
+passes that destination to SSH skill internally, captures its output, and connects
+through its allocated `127.0.0.1` port. Database credentials and SQL are never
+passed to SSH processes. Destination addresses are present in internal tunnel
+process arguments, but are not returned to the agent. The database configuration
+is unchanged. TLS continues to verify the original database hostname.
+
+SSH skill is discovered beside the loaded MySQL skill, then under personal
+`.agents`, `.codex`, `.claude`, and `.dsh` skill directories. Set
+`MYSQL_SKILL_SSH_ROOT` to override discovery. Set `MYSQL_SKILL_SSH_PYTHON` if SSH
+uses a separate interpreter; otherwise its own `.venv` is preferred, followed
+by the current interpreter's base Python. Install SSH dependencies in that
+interpreter, independently of the MySQL environment.
+
+Each call creates and stops its own tunnel, including after query errors. Existing
+tunnels are not reused or stopped. Cleanup failure is reported in `meta.warnings`
+with the tunnel ID; the query result or original error is retained. Inspect or stop
+that ID with SSH skill before repeating the operation. SSH subprocesses have a
+separate 45-second timeout; `--timeout` still controls database waits only.
+On `ssh_tunnel_unknown`, inspect SSH tunnel state before retrying because startup
+or shutdown may have completed. No direct or remote SQL fallback occurs.
+
 Use a SELECT-only MySQL account. Restrict local file permissions to its owner.
 The skill prevents normal agent workflows from reading credentials; it does
 not enforce OS access isolation against an agent that can read arbitrary files.
@@ -127,5 +160,6 @@ Error codes include `invalid_arguments`, `invalid_alias`, `config_not_found`,
 `invalid_config`, `invalid_sql`, `query_rejected`, `sql_file_error`,
 `dependency_missing`, `access_denied`, `query_timeout`, `connection_failed`,
 `connection_lost`, `unsupported_server`, `unsupported_feature`, `database_error`, `output_too_large`, `interrupted`, and
-`internal_error`. All errors have `retryable=false`. Raw server messages,
+`internal_error`, `ssh_skill_missing`, `ssh_unavailable`, `ssh_tunnel_failed`, and
+`ssh_tunnel_unknown`. All errors have `retryable=false`. Raw server messages,
 SQL text, stack traces, and connection arguments are not returned.

@@ -14,6 +14,7 @@ AI 通过别名调用查询，无需打开凭据文件或在对话中接收账�
 - 常用只读 SQL：`SHOW`、`DESCRIBE`、系统变量读取，以及常用查询函数。
 - 执行计划：`EXPLAIN SELECT`，支持传统格式和 JSON 格式，不支持 `EXPLAIN ANALYZE`。
 - 别名发现与本地诊断：不输出连接详情，不建立诊断连接。
+- SSH 跳板访问：通过服务器别名查询，自动建立并清理本地隧道。
 - 统一 JSON 输出、凭据脱敏、查询超时、行数和输出大小限制。
 - 支持 Windows、macOS 和 Linux，要求 Python 3.10+、MySQL 5.5+，建议 MySQL 8.0+。
 
@@ -81,7 +82,8 @@ python3 -m venv .venv
 ".venv/bin/python" "scripts/mysql_skill.py" doctor --json
 ```
 
-让 AI 使用该虚拟环境的 Python 执行 CLI。若工具尚未发现技能，重新加载技能或启动新会话。
+AI 优先使用技能目录内该虚拟环境的 Python，避免误用缺少依赖的系统 Python。
+若工具尚未发现技能，重新加载技能或启动新会话。
 
 ## 本地连接配置
 
@@ -106,7 +108,17 @@ python3 -m venv .venv
 
 可通过 `MYSQL_SKILL_CONFIG` 或全局参数 `--config "<PATH>"` 指定配置路径；`--config` 必须放在子命令之前。AI 通过 `config list` 获取别名。
 
-直连网络数据库时配置可验证的 TLS：在连接项中添加 `"tls": {"ca": "/local/path/ca.pem"}`；双向 TLS 可额外添加配对的 `cert` 和 `key` 路径。未配置 `tls` 时不主动启用 TLS。需要 SSH 隧道时，先由 SSH skill 建立本地隧道，再使用本机预先配置的 MySQL 别名。
+直连网络数据库时配置可验证的 TLS：在连接项中添加 `"tls": {"ca": "/local/path/ca.pem"}`；双向 TLS 可额外添加配对的 `cert` 和 `key` 路径。未配置 `tls` 时不主动启用 TLS。
+
+需要通过跳板机访问时，安装 SSH skill v4，在查询命令中添加 `--via <SSH别名>`。
+数据库配置保留跳板机可访问的目标地址和端口，无需改成本机地址。
+程序内部建立本地隧道、执行查询并清理，不向远程服务器传递数据库账密或 SQL。
+隧道保留原数据库主机名用于 TLS 校验。
+
+默认查找同级 `ssh-skill`，然后查找用户 `.agents`、`.codex`、`.claude`、`.dsh`
+下的技能目录。自定义安装可设置 `MYSQL_SKILL_SSH_ROOT`；SSH 使用独立 Python 时可设置
+`MYSQL_SKILL_SSH_PYTHON`。默认优先使用 SSH skill 自己的 `.venv`，否则使用当前 Python
+的基础解释器，SSH 依赖需安装在对应环境中。
 
 技能约束正常调用流程不读取凭据，不提供操作系统级文件隔离。脚本会在输出中替换连接地址、用户名和密码的原文匹配，包括查询结果中的匹配值；业务数据本身仍需按授权范围查询。
 
@@ -117,6 +129,8 @@ python3 -m venv .venv
 > 使用 MySQL 的 business 别名，查看有哪些订单表。
 >
 > 查询 business 库最近 10 笔失败订单，只返回订单号、状态和创建时间。
+>
+> 通过 jump 服务器查询 business 库的订单表结构。
 
 命令行示例，`<PYTHON>` 替换为虚拟环境 Python 路径：
 
@@ -131,7 +145,16 @@ python3 -m venv .venv
 <PYTHON> "scripts/mysql_skill.py" query --alias business --sql "SHOW INDEX FROM orders"
 <PYTHON> "scripts/mysql_skill.py" explain --alias business --sql "SELECT id FROM orders WHERE id = 42"
 <PYTHON> "scripts/mysql_skill.py" explain --alias business --sql-file "query.sql" --format json
+<PYTHON> "scripts/mysql_skill.py" query --alias business --via jump --sql "SELECT 1"
+<PYTHON> "scripts/mysql_skill.py" schema --alias business --via jump --table orders
+<PYTHON> "scripts/mysql_skill.py" explain --alias business --via jump --sql "SELECT id FROM orders WHERE id = 42"
 ```
+
+`--via` 适用于 `query`、`schema` 和 `explain`，每次调用独立建立并清理隧道，
+不修改原连接配置。SSH 原始输出由程序内部接收；隧道进程参数包含目标地址，
+不包含数据库账号密码。清理未确认时，`meta.warnings` 返回需要处理的隧道 ID，
+查询结果或原错误仍会保留。SSH 操作单独设有 45 秒超时，超时后先检查隧道状态，
+不自动重试或改用远程 SQL。
 
 也可以用 `query --sql "EXPLAIN SELECT ..."`。传统执行计划兼容 MySQL 5.5+，
 JSON 格式需要 MySQL 5.6.5+。执行计划保留原 SQL 的 LIMIT；`--limit` 只限制返回的

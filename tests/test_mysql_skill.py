@@ -4,6 +4,8 @@ import decimal
 import importlib.util
 import io
 import json
+import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -376,6 +378,151 @@ class SkillTests(unittest.TestCase):
                                 capture_output=True, text=True, check=True)
         self.assertEqual(result.stderr, "")
         self.assertEqual(json.loads(result.stdout)["data"], {"aliases": ["business"]})
+
+    def test_via_routes_all_operations_and_closes_only_its_tunnel(self):
+        for operation, arguments in (("query", ["--sql", "SELECT 1"]),
+                                     ("explain", ["--sql", "SELECT 1"]),
+                                     ("schema", ["--table", "orders"])):
+            with self.subTest(operation=operation), \
+                    patch.object(skill, "ssh_command", return_value=["ssh-python", "ssh_skill.py"]), \
+                    patch.object(skill, "call_ssh", side_effect=[{"local_port": 12345, "tunnel_id": "jump-12345"}, {}]) as ssh, \
+                    patch.object(skill, "execute", return_value={"rows": [[self.entry["host"], self.entry["password"]]]}) as execute:
+                before = self.config.read_text(encoding="utf-8")
+                status, result = self.invoke(operation, "--alias", "business", "--via", "jump", *arguments)
+                self.assertEqual(status, 0)
+                self.assertEqual(execute.call_args.kwargs, {"tunnel_port": 12345})
+                self.assertEqual(execute.call_args.args[0]["host"], self.entry["host"])
+                self.assertEqual(ssh.call_args_list[0].args[1],
+                                 ["start", "jump", "--remote-host", self.entry["host"], "--remote-port", "3306"])
+                self.assertEqual(ssh.call_args_list[1].args[1], ["stop", "jump-12345"])
+                self.assertNotIn(self.entry["password"], str(ssh.call_args_list))
+                for key in ("host", "user", "password"):
+                    self.assertNotIn(self.entry[key], json.dumps(result))
+                self.assertEqual(self.config.read_text(encoding="utf-8"), before)
+
+    def test_via_cleanup_preserves_query_error(self):
+        for cleanup in ({}, skill.SkillError("ssh_tunnel_failed", "Stop failed")):
+            with self.subTest(cleanup=cleanup), \
+                    patch.object(skill, "ssh_command", return_value=["ssh-python", "ssh_skill.py"]), \
+                    patch.object(skill, "call_ssh", side_effect=[{"local_port": 12345, "tunnel_id": "jump-12345"}, cleanup]) as ssh, \
+                    patch.object(skill, "execute", side_effect=skill.SkillError("query_timeout", "Query timed out")) as execute:
+                status, result = self.invoke("query", "--alias", "business", "--via", "jump", "--sql", "SELECT 1")
+                self.assertEqual(status, 1)
+                self.assertEqual(result["error"]["code"], "query_timeout")
+                self.assertEqual(ssh.call_count, 2)
+                execute.assert_called_once()
+                if isinstance(cleanup, Exception):
+                    self.assertIn("jump-12345", result["meta"]["warnings"][0])
+
+    def test_via_cleanup_failure_retains_successful_query(self):
+        with patch.object(skill, "ssh_command", return_value=["ssh-python", "ssh_skill.py"]), \
+                patch.object(skill, "call_ssh", side_effect=[{"local_port": 12345, "tunnel_id": "jump-12345"},
+                                                            skill.SkillError("ssh_tunnel_failed", "Stop failed")]), \
+                patch.object(skill, "execute", return_value={"rows": [[1]]}):
+            status, result = self.invoke("query", "--alias", "business", "--via", "jump", "--sql", "SELECT 1")
+        self.assertEqual(status, 0)
+        self.assertEqual(result["data"]["rows"], [[1]])
+        self.assertIn("jump-12345", result["meta"]["warnings"][0])
+
+    def test_rejected_sql_never_starts_tunnel(self):
+        with patch.object(skill, "call_ssh") as ssh:
+            status, result = self.invoke("query", "--alias", "business", "--via", "jump", "--sql", "DELETE FROM orders")
+        self.assertEqual(status, 1)
+        self.assertEqual(result["error"]["code"], "query_rejected")
+        ssh.assert_not_called()
+
+    def test_failed_or_invalid_tunnel_never_connects(self):
+        for data in (skill.SkillError("ssh_tunnel_failed", "Start failed"),
+                     {"local_port": 0, "tunnel_id": "jump-0"},
+                     {"local_port": 12345, "tunnel_id": "another-12345"}):
+            with self.subTest(data=data), patch.object(skill, "ssh_command", return_value=["python", "ssh_skill.py"]), \
+                    patch.object(skill, "call_ssh", side_effect=[data]) as ssh, patch.object(skill, "execute") as execute:
+                status, _ = self.invoke("query", "--alias", "business", "--via", "jump", "--sql", "SELECT 1")
+                self.assertEqual(status, 1)
+                execute.assert_not_called()
+                ssh.assert_called_once()
+
+    def test_ssh_raw_stdout_and_stderr_are_not_disclosed(self):
+        for stdout, code in ((self.entry["password"], 1),
+                             (json.dumps({"schema_version": "1.0", "success": False,
+                                          "error": self.entry}), 1)):
+            with self.subTest(stdout=stdout), patch.object(skill, "ssh_command", return_value=["python", "ssh_skill.py"]), \
+                    patch.object(skill.subprocess, "run", return_value=subprocess.CompletedProcess([], code, stdout, str(self.entry))) as process:
+                status, result = self.invoke("query", "--alias", "business", "--via", "jump", "--sql", "SELECT 1")
+                self.assertEqual(status, 1)
+                self.assertEqual(result["error"]["code"], "ssh_tunnel_failed")
+                self.assertNotIn(self.entry["password"], str(process.call_args.args))
+                for key in ("host", "user", "password"):
+                    self.assertNotIn(self.entry[key], json.dumps(result))
+
+    def test_ssh_timeout_is_not_retried(self):
+        with patch.object(skill.subprocess, "run", side_effect=subprocess.TimeoutExpired([self.entry["password"]], 45)) as process:
+            with self.assertRaises(skill.SkillError) as caught:
+                skill.call_ssh(["python", "ssh_skill.py"], ["start", "jump"])
+        self.assertEqual(caught.exception.code, "ssh_tunnel_unknown")
+        self.assertNotIn(self.entry["password"], str(caught.exception))
+        process.assert_called_once()
+
+    def test_ssh_runtime_uses_its_own_environment_or_base_python(self):
+        root = Path(self.temp.name) / "ssh-skill"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "ssh_skill.py").touch()
+        with patch.dict(os.environ, {"MYSQL_SKILL_SSH_ROOT": str(root), "MYSQL_SKILL_SSH_PYTHON": ""}):
+            self.assertEqual(skill.ssh_command()[0], sys._base_executable)
+            venv = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            venv.parent.mkdir(parents=True)
+            venv.touch()
+            self.assertEqual(skill.ssh_command()[0], str(venv))
+            with patch.dict(os.environ, {"MYSQL_SKILL_SSH_PYTHON": "custom-python"}):
+                self.assertEqual(skill.ssh_command()[0], "custom-python")
+
+    def test_tunnel_socket_preserves_tls_hostname_and_closes_connection(self):
+        import pymysql
+        options = skill.connection_options({"business": self.entry}, "business", 15)
+        options.update(ssl_ca="/fake/ca.pem", ssl_verify_cert=True, ssl_verify_identity=True)
+        connection = MagicMock()
+        connection.get_server_info.return_value = "5.7.20-log"
+        connection.cursor.return_value.__enter__.return_value.fetchmany.return_value = []
+        with patch.object(pymysql, "connect", return_value=connection) as connect, \
+                patch.object(skill.socket, "create_connection") as socket_connect:
+            skill.execute(options, "SELECT 1", None, 1, 15, tunnel_port=12345)
+        socket_connect.assert_called_once_with(("127.0.0.1", 12345), 10)
+        self.assertEqual(connect.call_args.kwargs["host"], self.entry["host"])
+        self.assertTrue(connect.call_args.kwargs["ssl_verify_identity"])
+        self.assertTrue(connect.call_args.kwargs["defer_connect"])
+        connection.connect.assert_called_once_with(sock=socket_connect.return_value)
+        connection.close.assert_called_once()
+
+    def test_via_subprocess_captures_ssh_output_and_cleans_up_on_connection_failure(self):
+        root = Path(self.temp.name) / "ssh-skill"
+        (root / "scripts").mkdir(parents=True)
+        trace = root / "trace.jsonl"
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            (root / "scripts" / "ssh_skill.py").write_text(
+                "import json,sys\nfrom pathlib import Path\n"
+                f"with Path({str(trace)!r}).open('a', encoding='utf-8') as log:\n"
+                "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                f"print({str(self.entry)!r}, file=sys.stderr)\n"
+                f"print(json.dumps({{'schema_version': '1.0', 'success': True, 'data': "
+                f"{{'local_port': {port}, 'tunnel_id': 'jump-{port}', 'ignored': {self.entry!r}}}}}))\n",
+                encoding="utf-8")
+            env = {**os.environ, "MYSQL_SKILL_SSH_ROOT": str(root), "MYSQL_SKILL_SSH_PYTHON": sys.executable}
+            process = subprocess.run([sys.executable, str(ROOT / "scripts" / "mysql_skill.py"),
+                                      "--config", str(self.config), "query", "--alias", "business",
+                                      "--via", "jump", "--sql", "SELECT 1", "--timeout", "1"],
+                                     capture_output=True, text=True, timeout=15, env=env)
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual(process.stderr, "")
+        result = json.loads(process.stdout)
+        self.assertEqual(result["error"]["code"], "connection_failed")
+        calls = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(calls[-1], ["tunnel", "stop", f"jump-{port}"])
+        for key in ("user", "password"):
+            self.assertNotIn(self.entry[key], str(calls))
+        for key in ("host", "user", "password"):
+            self.assertNotIn(self.entry[key], process.stdout)
 
 
 if __name__ == "__main__":
