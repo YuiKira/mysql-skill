@@ -2,17 +2,19 @@
 
 [中文](README.md) | [English](README.en.md)
 
-**Let AI query MySQL without handing it your database credentials.**
+**Let AI run MySQL CRUD without handing it your database credentials.**
 
 Configure connections once on your machine. The local CLI reads the credentials,
 connects to MySQL, and redacts the current connection's address, username, and
-password from returned results. The agent invokes queries by alias without
+password from returned results. The agent invokes queries and data changes by alias without
 opening the credential file or receiving credentials in chat. Works with
 **Codex, Claude Code, and DeepSeek Harness (dsh)**.
 
 ## Features
 
 - Read-only SELECT and UNION queries; CTEs on MySQL 8.0+.
+- INSERT, UPDATE, and DELETE, including multirow inserts, INSERT SELECT, INSERT IGNORE, and upserts.
+- Automatic commit on success, affected rows and insert IDs, rollback on failure, and no automatic retries.
 - Table discovery and column inspection.
 - Common read-only SQL: SHOW, DESCRIBE, system variable reads, and common query functions.
 - EXPLAIN SELECT plans in traditional or JSON format; EXPLAIN ANALYZE is excluded.
@@ -21,7 +23,7 @@ opening the credential file or receiving credentials in chat. Works with
 - JSON output, credential redaction, query timeouts, and bounded results.
 - Windows, macOS, and Linux; Python 3.10+ and MySQL 5.5+ required. MySQL 8.0+ recommended.
 
-This version excludes writes, migrations, stored procedures, and MariaDB.
+This version excludes DDL, migrations, stored procedures, and MariaDB.
 DDL, grants, SET, CALL, file access, and multiple statements are also rejected.
 Functions remain allowlisted; unknown stored functions and UDFs are not assumed
 safe. SHOW GRANTS and SHOW CREATE USER are excluded.
@@ -31,14 +33,15 @@ safe. SHOW GRANTS and SHOW CREATE USER are excluded.
 Version strings such as `5.5.20-log`, `5.6.16-log`, and `5.7.20` are supported.
 The `-log` suffix does not affect version detection.
 
-| MySQL version | Transaction mode | Timeout |
+| MySQL version | Read transaction mode | Read timeout |
 | --- | --- | --- |
-| 5.5.x, 5.6.0-5.6.4 | Regular transaction; SELECT-only grants enforce account permissions | Socket read |
+| 5.5.x, 5.6.0-5.6.4 | Regular transaction | Socket read |
 | 5.6.5-5.7.7 | READ ONLY | Socket read |
 | 5.7.8+ | READ ONLY | Server SELECT and socket read |
 
-Use a dedicated SELECT-only account on every version. Socket timeout does not
-cancel server work. SQL must match the target version: CTEs and window functions
+Writes use regular transactions and socket read timeouts on every supported version.
+Use grants appropriate to the intended operations. SELECT-only accounts remain usable
+for reads. Socket timeout does not cancel server work. SQL must match the target version: CTEs and window functions
 require MySQL 8.0+; JSON functions require 5.7+.
 
 ## Installation
@@ -115,13 +118,17 @@ Manually copy `config/connections.example.json` to
 }
 ```
 
-Plaintext local passwords are supported. Use a dedicated SELECT-only account
+Plaintext local passwords are supported. Grant SELECT, INSERT, UPDATE, and DELETE as needed
 and restrict file access to its local owner. Never commit the real file,
 paste it into chat, or ask the agent to open it.
 
 Override the location with `MYSQL_SKILL_CONFIG` or the global
 `--config "<PATH>"` option before the subcommand. Agents discover aliases with
 `config list`.
+
+Existing version 1 connection files work unchanged; no new aliases or fields are
+required. Updating the skill does not change database grants. SELECT-only accounts
+can still query; unauthorized writes return `access_denied`.
 
 For direct network connections, add verified TLS:
 `"tls": {"ca": "/local/path/ca.pem"}`. Add paired `cert` and `key` paths for
@@ -141,7 +148,7 @@ SSH dependencies must be installed in its chosen environment.
 
 The skill keeps credentials outside normal agent workflows; it does not enforce
 OS file isolation. Exact configured host, username, and password strings are
-redacted from output, including matching query values. Query business data only
+redacted from output, including matching query values. Access or change business data only
 within the user's authorized scope.
 
 ## Usage
@@ -153,6 +160,8 @@ Ask the agent, for example:
 > Query the latest 10 failed orders in business; return only order ID, status, and creation time.
 >
 > Inspect the business order table through the jump SSH server.
+>
+> Set order 42 in business to status done.
 
 Replace `<PYTHON>` with the virtual environment interpreter:
 
@@ -170,7 +179,21 @@ Replace `<PYTHON>` with the virtual environment interpreter:
 <PYTHON> "scripts/mysql_skill.py" query --alias business --via jump --sql "SELECT 1"
 <PYTHON> "scripts/mysql_skill.py" schema --alias business --via jump --table orders
 <PYTHON> "scripts/mysql_skill.py" explain --alias business --via jump --sql "SELECT id FROM orders WHERE id = 42"
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "INSERT INTO orders (id, status) VALUES (42, 'new')"
+<PYTHON> "scripts/mysql_skill.py" query --alias business --via jump --sql "UPDATE orders SET status = 'done' WHERE id = 42"
+<PYTHON> "scripts/mysql_skill.py" query --alias business --sql "DELETE FROM orders WHERE id = 42"
 ```
+
+Each `query` executes one statement. Writes return `affected_rows`, `last_insert_id`
+(null when absent), `committed`, and `execution`. Successful writes report
+`committed=true`. Affected rows follow MySQL semantics: unchanged updates can report
+zero, and an upsert update can report two. `--limit` only bounds SELECT results;
+it does not cap affected rows or rewrite INSERT SELECT. Express the intended write
+scope with SQL predicates or explicit LIMIT where appropriate.
+
+Write errors attempt rollback. Transactional engines such as InnoDB support rollback;
+nontransactional changes cannot be undone this way. On `write_outcome_unknown`, verify
+the actual database state before deciding what to do next. Never replay automatically.
 
 `--via` works with `query`, `schema`, and `explain`. Each call creates and cleans up
 its own tunnel without changing database configuration. Raw SSH output is captured
@@ -188,9 +211,10 @@ are text cells and may be truncated; inspect `cells_truncated`. Each call
 opens a fresh connection, so SHOW WARNINGS/ERRORS cannot inspect a previous call.
 
 The default returned row limit is 100, maximum 1,000. `--timeout` defaults to
-15 seconds, maximum 60. MySQL 5.7.8+ uses it for the server SELECT timeout.
+15 seconds, maximum 60. MySQL 5.7.8+ uses it for the server SELECT timeout; writes
+do not use that server timeout.
 On every version, socket read timeout is that value plus 5 seconds; it limits
-individual read waits, not total execution time. The CLI also tightens the top-level SQL
+individual read waits, not total execution time. For read SELECTs, the CLI tightens the top-level SQL
 LIMIT to the returned row limit plus one, preserving a smaller existing limit
 and the offset. Scans, sorts, and aggregations can still process more rows.
 
@@ -218,6 +242,8 @@ tests are skipped unless `MYSQL_SKILL_TEST_PORT` points to a disposable local
 test instance. Optional `MYSQL_SKILL_TEST_PASSWORD` supplies that instance's root
 password. Never target a business instance. GitHub Actions also defines
 isolated MySQL 5.5, 5.6, 5.7, and 8.0 integration services.
+CRUD tests create temporary InnoDB tables and a SELECT-only account on the disposable
+instance to verify persistence, rollback, and grants, then clean them up.
 
 ## License
 

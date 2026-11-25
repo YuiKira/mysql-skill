@@ -89,7 +89,7 @@ class SkillTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "invalid_arguments")
         execute.assert_not_called()
 
-    def test_writes_and_side_effects_are_rejected(self):
+    def test_readonly_validator_rejects_writes_and_side_effects(self):
         rejected = [
             "DELETE FROM orders", "SELECT 1; SELECT 2",
             "SELECT * FROM orders FOR UPDATE", "SELECT 1 INTO OUTFILE '/tmp/file'",
@@ -118,6 +118,123 @@ class SkillTests(unittest.TestCase):
         self.assertIn("LIMIT 3 OFFSET 7", skill.validate_sql("SELECT id FROM orders LIMIT 3 OFFSET 7", 10))
         self.assertIn("LIMIT 11 OFFSET 7", skill.validate_sql("SELECT id FROM orders LIMIT 500 OFFSET 7", 10))
         self.assertIn("LIMIT 0", skill.validate_sql("SELECT 1 LIMIT 0", 10))
+
+    def test_crud_sql_preserves_write_scope(self):
+        statements = [
+            "INSERT INTO orders(id, status) VALUES (1, 'new'), (2, 'new')",
+            "INSERT IGNORE INTO orders(id) VALUES (1)",
+            "INSERT INTO orders(id) SELECT id FROM archived_orders LIMIT 500",
+            "INSERT INTO orders(id) VALUES (1) ON DUPLICATE KEY UPDATE id=VALUES(id)",
+            "UPDATE orders SET status='ok' WHERE id=1 LIMIT 500",
+            "UPDATE orders o JOIN details d ON o.id=d.id SET o.status=d.status WHERE o.id=1",
+            "DELETE FROM orders WHERE id=1 LIMIT 500",
+            "DELETE o FROM orders o JOIN details d ON o.id=d.id WHERE o.id=1",
+            "UPDATE orders SET status='ok'", "DELETE FROM orders",
+            "WITH x AS (SELECT 1 AS id) UPDATE orders JOIN x ON orders.id=x.id SET status='ok'",
+        ]
+        for sql in statements:
+            with self.subTest(sql=sql), patch.object(skill, "execute", return_value={}) as execute:
+                status, _ = self.invoke("query", "--alias", "business", "--sql", sql, "--limit", "1")
+                self.assertEqual(status, 0)
+                self.assertEqual(execute.call_args.kwargs, {"write": True})
+                self.assertNotIn("LIMIT 2", execute.call_args.args[1])
+                if "LIMIT 500" in sql:
+                    self.assertIn("LIMIT 500", execute.call_args.args[1])
+
+    def test_crud_rejects_side_effects_and_nested_writes(self):
+        statements = [
+            "INSERT INTO orders VALUES (SLEEP(1))", "UPDATE orders SET id=arbitrary_udf(1)",
+            "DELETE FROM orders WHERE GET_LOCK('x',1)",
+            "INSERT INTO orders SELECT LOAD_FILE('/etc/passwd')",
+            "DELETE FROM orders; INSERT INTO orders VALUES(1)",
+            "WITH x AS (DELETE FROM orders RETURNING id) SELECT * FROM x",
+            "DELETE FROM orders RETURNING id", "UPDATE orders SET id=@x:=1",
+            "INSERT INTO orders VALUES (1) /*!50000 ON DUPLICATE KEY UPDATE id=2 */",
+        ]
+        for sql in statements:
+            with self.subTest(sql=sql), patch.object(skill, "execute") as execute:
+                status, _ = self.invoke("query", "--alias", "business", "--sql", sql)
+                self.assertEqual(status, 1)
+                execute.assert_not_called()
+
+    def test_write_uses_normal_transaction_and_commits_once(self):
+        import pymysql
+        for version in ("5.5.20-log", "5.6.16-log", "5.7.20", "8.0.44"):
+            with self.subTest(version=version):
+                connection = MagicMock()
+                connection.get_server_info.return_value = version
+                cursor = connection.cursor.return_value.__enter__.return_value
+                cursor.rowcount, cursor.lastrowid = 2, 42
+                with patch.object(pymysql, "connect", return_value=connection):
+                    result = skill.execute({"read_timeout": 20}, "INSERT INTO orders(id) VALUES (42),(43)",
+                                           None, 1, 15, write=True)
+                self.assertEqual([call.args[0] for call in cursor.execute.call_args_list],
+                                 ["START TRANSACTION", "INSERT INTO orders(id) VALUES (42),(43)"])
+                self.assertEqual(result["affected_rows"], 2)
+                self.assertEqual(result["last_insert_id"], 42)
+                self.assertTrue(result["committed"])
+                self.assertFalse(result["execution"]["read_only_transaction"])
+                self.assertEqual(result["execution"]["timeout_mode"], "socket")
+                cursor.fetchmany.assert_not_called()
+                connection.commit.assert_called_once()
+                connection.rollback.assert_not_called()
+                connection.close.assert_called_once()
+
+    def test_write_failure_rolls_back_without_commit_or_retry(self):
+        import pymysql
+        connection = MagicMock()
+        connection.get_server_info.return_value = "5.7.20"
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.execute.side_effect = [None, pymysql.IntegrityError(1062, self.entry["password"])]
+        with patch.object(pymysql, "connect", return_value=connection) as connect:
+            status, result = self.invoke("query", "--alias", "business", "--sql", "INSERT INTO orders(id) VALUES (1)")
+        self.assertEqual(status, 1)
+        self.assertEqual(result["error"]["code"], "database_error")
+        self.assertNotIn(self.entry["password"], json.dumps(result))
+        connection.rollback.assert_called_once()
+        connection.commit.assert_not_called()
+        connection.close.assert_called_once()
+        connect.assert_called_once()
+
+    def test_write_uncertain_outcome_is_never_reported_as_success(self):
+        import pymysql
+        for failure in ("commit", "disconnect", "interrupt", "rollback"):
+            with self.subTest(failure=failure):
+                connection = MagicMock()
+                connection.get_server_info.return_value = "5.7.20"
+                cursor = connection.cursor.return_value.__enter__.return_value
+                cursor.rowcount, cursor.lastrowid = 1, 0
+                if failure == "commit":
+                    connection.commit.side_effect = pymysql.OperationalError(2013, "lost")
+                else:
+                    error = KeyboardInterrupt() if failure == "interrupt" else pymysql.OperationalError(
+                        2013 if failure == "disconnect" else 1062, "failed")
+                    cursor.execute.side_effect = [None, error]
+                if failure == "rollback":
+                    connection.rollback.side_effect = pymysql.OperationalError(2013, "lost")
+                with patch.object(pymysql, "connect", return_value=connection) as connect:
+                    status, result = self.invoke("query", "--alias", "business", "--sql", "UPDATE orders SET id=2 WHERE id=1")
+                self.assertEqual(status, 1)
+                self.assertEqual(result["error"]["code"], "write_outcome_unknown")
+                self.assertFalse(result["error"]["retryable"])
+                self.assertIsNone(result["data"])
+                connection.rollback.assert_called_once()
+                connection.close.assert_called_once()
+                connect.assert_called_once()
+
+    @patch.object(skill.socket, "socket")
+    def test_crud_via_passes_write_mode_and_cleans_up(self, socket_factory):
+        socket_factory.return_value.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 12345)
+        sql_file = Path(self.temp.name) / "insert.sql"
+        sql_file.write_text("INSERT INTO orders(id) VALUES (1)", encoding="utf-8")
+        with patch.object(skill, "ssh_command", return_value=["python", "ssh_skill.py"]), \
+                patch.object(skill, "call_ssh", side_effect=[{"local_port": 12345, "tunnel_id": "jump-12345"}, {}]) as ssh, \
+                patch.object(skill, "execute", return_value={"affected_rows": 1, "committed": True}) as execute:
+            status, result = self.invoke("query", "--alias", "business", "--via", "jump", "--sql-file", str(sql_file))
+        self.assertEqual(status, 0)
+        self.assertEqual(execute.call_args.kwargs, {"write": True, "tunnel_port": 12345})
+        self.assertTrue(result["data"]["committed"])
+        self.assertEqual(ssh.call_args_list[-1].args[1], ["stop", "jump-12345"])
 
     def test_rejected_query_never_connects(self):
         with patch.object(skill, "execute") as execute:
@@ -178,6 +295,7 @@ class SkillTests(unittest.TestCase):
         cursor.fetchmany.assert_called_once_with(3)
         self.assertEqual(result["rows"], [[1], [2]])
         self.assertTrue(result["truncated"])
+        connection.commit.assert_not_called()
         connection.close.assert_called_once()
 
     def test_setup_failure_stops_before_user_query_and_closes(self):
@@ -432,7 +550,7 @@ class SkillTests(unittest.TestCase):
 
     def test_rejected_sql_never_starts_tunnel(self):
         with patch.object(skill, "call_ssh") as ssh:
-            status, result = self.invoke("query", "--alias", "business", "--via", "jump", "--sql", "DELETE FROM orders")
+            status, result = self.invoke("query", "--alias", "business", "--via", "jump", "--sql", "DROP TABLE orders")
         self.assertEqual(status, 1)
         self.assertEqual(result["error"]["code"], "query_rejected")
         ssh.assert_not_called()

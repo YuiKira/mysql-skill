@@ -1,12 +1,14 @@
 """Run only against an explicitly configured disposable test server."""
 
 import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,6 +36,89 @@ class IntegrationTests(unittest.TestCase):
         result = json.loads(process.stdout)
         self.assertEqual(process.returncode, 0 if result["success"] else 1)
         return result
+
+    @contextmanager
+    def writable_database(self):
+        import pymysql
+
+        database = "mysql_skill_test_" + uuid.uuid4().hex
+        with pymysql.connect(**self.entry, autocommit=True) as admin:
+            with admin.cursor() as cursor:
+                cursor.execute(f"CREATE DATABASE `{database}`")
+                try:
+                    cursor.execute(f"CREATE TABLE `{database}`.items (id INT PRIMARY KEY AUTO_INCREMENT, "
+                                   "name VARCHAR(80) NOT NULL UNIQUE, amount INT NOT NULL) ENGINE=InnoDB")
+                    self.entry["database"] = database
+                    self.write_config()
+                    yield cursor
+                finally:
+                    cursor.execute(f"DROP DATABASE `{database}`")
+
+    def test_crud_commits_across_independent_calls(self):
+        with self.writable_database():
+            inserted = self.invoke("query", "--sql", "INSERT INTO items(name,amount) VALUES ('one',1),('two',2)", "--limit", "1")
+            self.assertTrue(inserted["success"], inserted["error"])
+            self.assertEqual(inserted["data"]["affected_rows"], 2)
+            self.assertEqual(inserted["data"]["last_insert_id"], 1)
+            self.assertTrue(inserted["data"]["committed"])
+            self.assertFalse(inserted["data"]["execution"]["read_only_transaction"])
+            self.assertEqual(inserted["data"]["execution"]["timeout_mode"], "socket")
+            updated = self.invoke("query", "--sql", "UPDATE items SET amount=7 WHERE name='one'")
+            self.assertTrue(updated["success"], updated["error"])
+            self.assertEqual(updated["data"]["affected_rows"], 1)
+            self.assertIsNone(updated["data"]["last_insert_id"])
+            rows = self.invoke("query", "--sql", "SELECT name,amount FROM items ORDER BY id")
+            self.assertEqual(rows["data"]["rows"], [["one", 7], ["two", 2]])
+            deleted = self.invoke("query", "--sql", "DELETE FROM items WHERE name='two'")
+            self.assertTrue(deleted["success"], deleted["error"])
+            self.assertEqual(deleted["data"]["affected_rows"], 1)
+            missing = self.invoke("query", "--sql", "DELETE FROM items WHERE id=999")
+            self.assertTrue(missing["data"]["committed"])
+            self.assertEqual(missing["data"]["affected_rows"], 0)
+            self.assertEqual(self.invoke("query", "--sql", "SELECT COUNT(*) FROM items")["data"]["rows"], [[1]])
+
+    def test_insert_select_ignore_upsert_and_sql_file(self):
+        with self.writable_database():
+            sql_file = Path(self.temp.name) / "insert.sql"
+            sql_file.write_text("INSERT INTO items(name,amount) VALUES ('one',1)", encoding="utf-8")
+            self.assertTrue(self.invoke("query", "--sql-file", str(sql_file))["success"])
+            statements = [
+                "INSERT INTO items(name,amount) SELECT 'two',amount FROM items WHERE name='one'",
+                "INSERT IGNORE INTO items(name,amount) VALUES ('one',99)",
+                "INSERT INTO items(name,amount) VALUES ('one',3) ON DUPLICATE KEY UPDATE amount=VALUES(amount)",
+            ]
+            for sql in statements:
+                result = self.invoke("query", "--sql", sql)
+                self.assertTrue(result["success"], result["error"])
+                self.assertTrue(result["data"]["committed"])
+            self.assertEqual(self.invoke("query", "--sql", "SELECT name,amount FROM items ORDER BY name")["data"]["rows"],
+                             [["one", 3], ["two", 1]])
+
+    def test_failed_multirow_insert_rolls_back(self):
+        with self.writable_database():
+            failed = self.invoke("query", "--sql", "INSERT INTO items(name,amount) VALUES ('same',1),('same',2)")
+            self.assertFalse(failed["success"])
+            self.assertEqual(failed["error"]["code"], "database_error")
+            self.assertFalse(failed["error"]["retryable"])
+            self.assertEqual(self.invoke("query", "--sql", "SELECT COUNT(*) FROM items")["data"]["rows"], [[0]])
+
+    def test_existing_select_only_account_cannot_write(self):
+        with self.writable_database() as cursor:
+            username = "reader_" + uuid.uuid4().hex[:8]
+            cursor.execute(f"CREATE USER '{username}'@'%' IDENTIFIED BY 'disposable-reader-password'")
+            try:
+                cursor.execute(f"GRANT SELECT ON `{self.entry['database']}`.* TO '{username}'@'%'")
+                self.entry.update(user=username, password="disposable-reader-password")
+                self.write_config()
+                self.assertTrue(self.invoke("query", "--sql", "SELECT COUNT(*) FROM items")["success"])
+                failed = self.invoke("query", "--sql", "INSERT INTO items(name,amount) VALUES ('blocked',1)")
+                self.assertFalse(failed["success"])
+                self.assertEqual(failed["error"]["code"], "access_denied")
+                for value in (username, self.entry["password"]):
+                    self.assertNotIn(value, json.dumps(failed))
+                self.assertEqual(self.invoke("query", "--sql", "SELECT COUNT(*) FROM items")["data"]["rows"], [[0]])
+            finally:
+                cursor.execute(f"DROP USER '{username}'@'%'")
 
     def test_select_and_streaming_truncation(self):
         result = self.invoke("query", "--sql", "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3", "--limit", "2")

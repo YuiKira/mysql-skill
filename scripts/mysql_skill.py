@@ -20,7 +20,7 @@ import time
 import uuid
 import warnings
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_SQL_BYTES = 64 * 1024
 MAX_CELL_CHARS = 4096
@@ -43,7 +43,7 @@ SIGN SIN SPACE SQRT STD STDDEV STDDEV_POP STDDEV_SAMP STR_TO_DATE STRCMP
 SUBDATE SUBSTR SUBSTRING SUBSTRING_INDEX SUM TAN TIME TIMEDIFF TIMESTAMP
 TIMESTAMPADD TIMESTAMPDIFF TIME_FORMAT TIME_TO_SEC TIME_TO_STR TO_DAYS TRIM TRUNCATE
 TS_OR_DS_TO_DATE TS_OR_DS_TO_TIMESTAMP
-UCASE UNHEX UNIX_TIMESTAMP UPPER VARIANCE VAR_POP VAR_SAMP WEEK WEEKDAY
+UCASE UNHEX UNIX_TIMESTAMP UPPER VALUES VARIANCE VAR_POP VAR_SAMP WEEK WEEKDAY
 WEEKOFYEAR YEAR YEARWEEK CURRENT_SCHEMA CURRENT_VERSION CURRENT_USER
 DATABASE VERSION USER SESSION_USER SYSTEM_USER CONNECTION_ID CHAR CHR
 CONCAT_WS CURRENT_DATETIME DATE_FROM_PARTS DATE_TO_DATE_STR DATE_TO_DI
@@ -154,6 +154,10 @@ def connection_options(connections, alias, timeout):
 
 
 def validate_sql(sql, row_limit=None):
+    return validate_statement(sql, row_limit)[0]
+
+
+def validate_statement(sql, row_limit=None, allow_write=False):
     if not sql.strip() or len(sql.encode("utf-8")) > MAX_SQL_BYTES:
         raise SkillError("invalid_sql", "Provide a query no larger than 64 KiB.")
     if "/*!" in sql or "/*M!" in sql.upper():
@@ -169,8 +173,9 @@ def validate_sql(sql, row_limit=None):
     except Exception:
         raise SkillError("invalid_sql", "Cannot parse the query as MySQL SQL.") from None
     if len(statements) != 1:
-        raise SkillError("query_rejected", "Only one SELECT or EXPLAIN SELECT statement is supported.")
+        raise SkillError("query_rejected", "Only one SQL statement is supported.")
     tree = statements[0]
+    write = allow_write and isinstance(tree, (exp.Insert, exp.Update, exp.Delete))
     explain_prefix = None
     metadata_statement = False
     if isinstance(tree, exp.Show):
@@ -191,26 +196,29 @@ def validate_sql(sql, row_limit=None):
         else:
             explain_prefix = "EXPLAIN FORMAT=JSON " if plan_format == "JSON" else "EXPLAIN "
             tree = tree.this
-    if not metadata_statement and not isinstance(tree, (exp.Select, exp.Union)):
-        raise SkillError("query_rejected", "Only SELECT, SHOW, DESCRIBE, or EXPLAIN SELECT is supported.")
+    if not metadata_statement and not write and not isinstance(tree, (exp.Select, exp.Union)):
+        raise SkillError("query_rejected", "Use SELECT, INSERT, UPDATE, DELETE, SHOW, DESCRIBE, or EXPLAIN SELECT.")
+    if write and tree.args.get("returning"):
+        raise SkillError("query_rejected", "MySQL DML RETURNING is not supported.")
     for node in tree.walk():
-        if isinstance(node, (exp.Into, exp.Lock, exp.Command, exp.DDL, exp.DML,
-                             exp.Parameter)):
-            raise SkillError("query_rejected", "Writes, locks, variables, and output files are not supported.")
+        if (isinstance(node, (exp.Into, exp.Lock, exp.Command, exp.Parameter))
+                or isinstance(node, exp.DDL) and not (write and node is tree)
+                or isinstance(node, exp.DML) and node is not tree):
+            raise SkillError("query_rejected", "Nested writes, locks, variables, and output files are not supported.")
         if isinstance(node, exp.Func):
             name = node.name.upper() if isinstance(node, exp.Anonymous) else node.sql_name()
             if name not in SAFE_FUNCTIONS:
                 raise SkillError("query_rejected", "The query contains an unsupported function.")
             if isinstance(node.parent, exp.Dot):
                 raise SkillError("query_rejected", "Qualified function calls are not supported.")
-    if row_limit is not None and explain_prefix is None and not metadata_statement:
+    if row_limit is not None and explain_prefix is None and not metadata_statement and not write:
         existing = tree.args.get("limit")
         expression = existing.expression if existing else None
         cap = row_limit + 1
         if isinstance(expression, exp.Literal) and expression.is_int:
             cap = min(cap, max(0, int(expression.this)))
         tree.limit(cap, copy=False)
-    return (explain_prefix or "") + tree.sql(dialect="mysql")
+    return (explain_prefix or "") + tree.sql(dialect="mysql"), write
 
 
 def dependency_status():
@@ -324,10 +332,12 @@ def server_capabilities(server_info):
             "server_timeout": version >= (5, 7, 8)}
 
 
-def execute(options, sql, params, limit, timeout, tunnel_port=None):
+def execute(options, sql, params, limit, timeout, tunnel_port=None, write=False):
     import pymysql
 
     connection = None
+    write_sent = False
+    commit_started = False
     try:
         if tunnel_port is None:
             connection = pymysql.connect(**options, cursorclass=pymysql.cursors.SSCursor)
@@ -343,13 +353,24 @@ def execute(options, sql, params, limit, timeout, tunnel_port=None):
         if sql.startswith("EXPLAIN FORMAT=JSON ") and tuple(map(int, capabilities["server_version"].split("."))) < (5, 6, 5):
             raise SkillError("unsupported_feature", "JSON EXPLAIN requires MySQL 5.6.5 or newer; use traditional format.")
         with connection.cursor() as cursor:
-            if capabilities["server_timeout"]:
+            if capabilities["server_timeout"] and not write:
                 cursor.execute("SET SESSION MAX_EXECUTION_TIME = %s", (timeout * 1000,))
-            if capabilities["read_only_transaction"]:
+            if capabilities["read_only_transaction"] and not write:
                 cursor.execute("START TRANSACTION READ ONLY")
             else:
                 cursor.execute("START TRANSACTION")
+            write_sent = write
             cursor.execute(sql, params)
+            if write:
+                data = {"affected_rows": cursor.rowcount, "last_insert_id": cursor.lastrowid or None,
+                        "committed": False,
+                        "execution": {"server_version": capabilities["server_version"],
+                                      "read_only_transaction": False, "timeout_mode": "socket",
+                                      "timeout_seconds": options["read_timeout"]}}
+                commit_started = True
+                connection.commit()
+                data["committed"] = True
+                return data
             columns = [column[0] for column in cursor.description or ()]
             rows = []
             truncated_cells = False
@@ -365,8 +386,20 @@ def execute(options, sql, params, limit, timeout, tunnel_port=None):
                                   "read_only_transaction": capabilities["read_only_transaction"],
                                   "timeout_mode": "server" if capabilities["server_timeout"] else "socket",
                                   "timeout_seconds": timeout if capabilities["server_timeout"] else options["read_timeout"]}}
-    except pymysql.MySQLError as error:
-        raise database_error(error) from None
+    except BaseException as error:
+        rollback_failed = False
+        if write_sent and connection is not None:
+            try:
+                connection.rollback()
+            except (pymysql.MySQLError, OSError):
+                rollback_failed = True
+        code = error.args[0] if isinstance(error, pymysql.MySQLError) and error.args else None
+        if write_sent and (commit_started or rollback_failed or code in (2006, 2013)
+                           or isinstance(error, (KeyboardInterrupt, OSError))):
+            raise SkillError("write_outcome_unknown", "Write outcome is unknown; verify database state before another write. Do not retry automatically.") from None
+        if isinstance(error, pymysql.MySQLError):
+            raise database_error(error) from None
+        raise
     finally:
         if connection is not None:
             try:
@@ -401,6 +434,7 @@ def run(args, secrets, notices):
     secrets.extend(options[key] for key in ("host", "user", "password") if options[key])
     require_dependencies()
     params = None
+    write = False
     if args.command in ("query", "explain"):
         try:
             if args.sql_file:
@@ -414,7 +448,7 @@ def run(args, secrets, notices):
         if args.command == "explain":
             prefix = "EXPLAIN FORMAT=JSON " if args.format == "json" else "EXPLAIN "
             sql = prefix + sql
-        sql = validate_sql(sql, args.limit)
+        sql, write = validate_statement(sql, args.limit, allow_write=args.command == "query")
     elif args.table:
         sql = ("SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA "
                "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
@@ -424,10 +458,11 @@ def run(args, secrets, notices):
         sql = ("SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
                "WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME LIMIT %s")
         params = (options["database"], args.limit + 1)
+    execution_options = {"write": True} if write else {}
     if args.via:
         with ssh_tunnel(args.via, options, notices) as port:
-            return execute(options, sql, params, args.limit, args.timeout, tunnel_port=port)
-    return execute(options, sql, params, args.limit, args.timeout)
+            return execute(options, sql, params, args.limit, args.timeout, tunnel_port=port, **execution_options)
+    return execute(options, sql, params, args.limit, args.timeout, **execution_options)
 
 
 def redact(value, secrets):
